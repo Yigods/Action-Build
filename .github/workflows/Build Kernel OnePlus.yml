@@ -492,8 +492,8 @@ jobs:
             pin_repo "$PWD/kernel_platform/msm-kernel" 9c349a72a250c9bfdc3360cc2a549c2c2d133fc6 msm
             # workflow_dispatch can execute a selected workflow file while
             # actions/checkout still supplies the repository default tree.
-            # Fetch the reviewed patch pair from this immutable feature ref.
-            GH_PATCH_REF=ghosthook-router-pkg1106118
+            # Fetch the reviewed patch pair from its immutable commit.
+            GH_PATCH_REF=1b92b0528c652da169176616918a4770a8ae52f0
             GH_PATCH_BASE="https://raw.githubusercontent.com/Yigods/Action-Build/${GH_PATCH_REF}/patches/ghosthook"
             GH_PATCH_DIR="$PWD/.ghosthook-router-patch"
             mkdir -p "$GH_PATCH_DIR"
