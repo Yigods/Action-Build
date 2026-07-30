@@ -189,6 +189,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          # workflow_dispatch does not otherwise guarantee that a manually
+          # selected branch is checked out; build patches must match headSha.
+          ref: ${{ github.sha }}
 
       - name: Maximize Build Space
         if: ${{ github.event.inputs.SPACE_NOCLEAN == 'false' }}
