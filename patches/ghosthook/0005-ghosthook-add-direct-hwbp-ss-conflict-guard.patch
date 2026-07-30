@@ -1,0 +1,106 @@
+diff --git a/arch/arm64/kernel/hw_breakpoint.c b/arch/arm64/kernel/hw_breakpoint.c
+index b51d4ba..9b90ef6
+--- a/arch/arm64/kernel/hw_breakpoint.c
++++ b/arch/arm64/kernel/hw_breakpoint.c
+@@ -61,6 +61,10 @@ struct gh_hwbp_direct_state {
+ 	bool active;
+ 	bool disarming;
+ 	bool stepping;
++	/* True only while this owner has set TIF_SINGLESTEP itself. */
++	bool ss_owned;
++	/* A foreign user single-step was observed: leave the direct BRP disabled. */
++	bool ss_conflicted;
+ };
+ 
+ #define GH_HWBP_DIRECT_TRACE_CAP 64
+@@ -104,9 +108,19 @@ static void gh_hwbp_direct_sync_task(struct task_struct *task)
+ 
+ 	raw_spin_lock_irqsave(&gh_hwbp_direct_lock, flags);
+ 	if (gh_hwbp_direct.active && gh_hwbp_direct_task_matches(task)) {
++		/*
++		 * TIF_SINGLESTEP is shared with ptrace and the generic breakpoint
++		 * code.  This backend never borrows a pre-existing request.  If an
++		 * external owner appears, fail closed by leaving our BRP disabled;
++		 * the original debug exception remains visible to the stock path.
++		 */
++		if (test_tsk_thread_flag(task, TIF_SINGLESTEP) &&
++		    !gh_hwbp_direct.ss_owned)
++			gh_hwbp_direct.ss_conflicted = true;
+ 		slot = gh_hwbp_direct.slot;
+ 		pc = gh_hwbp_direct.pc;
+-		enable = !gh_hwbp_direct.stepping && !gh_hwbp_direct.disarming;
++		enable = !gh_hwbp_direct.stepping && !gh_hwbp_direct.disarming &&
++			 !gh_hwbp_direct.ss_conflicted;
+ 	}
+ 	raw_spin_unlock_irqrestore(&gh_hwbp_direct_lock, flags);
+ 
+@@ -196,17 +210,26 @@ static bool gh_hwbp_direct_debug_event(unsigned long addr_if_watchpoint,
+ 	if (event == DBG_ESR_EVT_HWBP && !gh_hwbp_direct.disarming &&
+ 	    !gh_hwbp_direct.stepping &&
+ 	    pc == gh_hwbp_direct.pc) {
++		if (test_thread_flag(TIF_SINGLESTEP)) {
++			/* Do not consume or clear another single-step user's state. */
++			write_wb_reg(AARCH64_DBG_REG_BCR, gh_hwbp_direct.slot, 0);
++			gh_hwbp_direct.ss_conflicted = true;
++			goto out;
++		}
+ 		/* Disable this exact BRP, execute one original instruction, rearm. */
+ 		write_wb_reg(AARCH64_DBG_REG_BCR, gh_hwbp_direct.slot, 0);
+ 		gh_hwbp_direct.hits++;
+ 		gh_hwbp_direct_record_trace(regs);
+ 		gh_hwbp_direct.stepping = true;
++		gh_hwbp_direct.ss_owned = true;
+ 		user_enable_single_step(current);
+ 		consumed = true;
+-	} else if (event == DBG_ESR_EVT_HWSS && gh_hwbp_direct.stepping) {
++	} else if (event == DBG_ESR_EVT_HWSS && gh_hwbp_direct.stepping &&
++		   gh_hwbp_direct.ss_owned) {
+ 		gh_hwbp_direct.stepping = false;
++		gh_hwbp_direct.ss_owned = false;
+ 		user_disable_single_step(current);
+-		if (!gh_hwbp_direct.disarming) {
++		if (!gh_hwbp_direct.disarming && !gh_hwbp_direct.ss_conflicted) {
+ 			write_wb_reg(AARCH64_DBG_REG_BVR, gh_hwbp_direct.slot,
+ 				     gh_hwbp_direct.pc);
+ 			write_wb_reg(AARCH64_DBG_REG_BCR, gh_hwbp_direct.slot,
+@@ -249,6 +272,12 @@ int gh_hwbp_direct_arm(pid_t tid, unsigned long pc)
+ 		put_pid(pid);
+ 		return -EBUSY;
+ 	}
++	if (test_tsk_thread_flag(task, TIF_SINGLESTEP)) {
++		raw_spin_unlock_irqrestore(&gh_hwbp_direct_lock, flags);
++		put_task_struct(task);
++		put_pid(pid);
++		return -EBUSY;
++	}
+ 	/*
+ 	 * hw_breakpoint_control() uses this same lock while claiming a perf
+ 	 * execution slot.  The scan and state transition are therefore atomic
+@@ -269,6 +298,8 @@ int gh_hwbp_direct_arm(pid_t tid, unsigned long pc)
+ 	gh_hwbp_direct.last_cpu = -1;
+ 	gh_hwbp_direct.disarming = false;
+ 	gh_hwbp_direct.stepping = false;
++	gh_hwbp_direct.ss_owned = false;
++	gh_hwbp_direct.ss_conflicted = false;
+ 	gh_hwbp_direct.active = true;
+ 	raw_spin_unlock_irqrestore(&gh_hwbp_direct_lock, flags);
+ 
+@@ -317,6 +348,8 @@ int gh_hwbp_direct_disarm(pid_t tid)
+ 	gh_hwbp_direct.slot = -1;
+ 	gh_hwbp_direct.last_cpu = -1;
+ 	gh_hwbp_direct.stepping = false;
++	gh_hwbp_direct.ss_owned = false;
++	gh_hwbp_direct.ss_conflicted = false;
+ 	gh_hwbp_direct.disarming = false;
+ 	gh_hwbp_direct.active = false;
+ 	raw_spin_unlock_irqrestore(&gh_hwbp_direct_lock, flags);
+@@ -339,7 +372,8 @@ int gh_hwbp_direct_get_stats(struct gh_hwbp_direct_stats *stats)
+ 	stats->pc = gh_hwbp_direct.pc;
+ 	stats->hits = gh_hwbp_direct.hits;
+ 	stats->last_cpu = gh_hwbp_direct.last_cpu;
+-	stats->armed = gh_hwbp_direct.active && !gh_hwbp_direct.disarming;
++	stats->armed = gh_hwbp_direct.active && !gh_hwbp_direct.disarming &&
++		       !gh_hwbp_direct.ss_conflicted;
+ 	raw_spin_unlock_irqrestore(&gh_hwbp_direct_lock, flags);
+ 	return 0;
+ }

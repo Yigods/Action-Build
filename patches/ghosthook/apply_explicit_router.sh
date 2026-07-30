@@ -6,7 +6,10 @@ set -eu
 expected=8a82a099c89b90b54c8698db456ab8cf9a25b14e
 self_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 common=${1:?usage: $0 /path/to/kernel_platform/common}
-[ -d "$common/.git" ] || { echo "not a git worktree: $common" >&2; exit 2; }
+git -C "$common" rev-parse --is-inside-work-tree >/dev/null 2>&1 || {
+    echo "not a git worktree: $common" >&2
+    exit 2
+}
 actual=$(git -C "$common" rev-parse HEAD)
 [ "$actual" = "$expected" ] || {
     echo "refusing: common HEAD=$actual, expected=$expected" >&2
@@ -20,7 +23,8 @@ for patch in \
     "$self_dir/0001-ghosthook-add-explicit-fault-router-point.patch" \
     "$self_dir/0002-ghosthook-add-explicit-debug-router-point.patch" \
     "$self_dir/0003-ghosthook-add-direct-el0-hwbp.patch" \
-    "$self_dir/0004-ghosthook-add-direct-hwbp-trace-ring.patch"; do
+    "$self_dir/0004-ghosthook-add-direct-hwbp-trace-ring.patch" \
+    "$self_dir/0005-ghosthook-add-direct-hwbp-ss-conflict-guard.patch"; do
     [ -f "$patch" ] || { echo "missing patch: $patch" >&2; exit 5; }
     git -C "$common" apply --check "$patch"
     git -C "$common" apply "$patch"
@@ -34,5 +38,6 @@ grep -q 'gh_debug_router_register_core' "$common/arch/arm64/mm/fault.c"
 grep -q 'gh_hwbp_direct_arm' "$common/arch/arm64/kernel/hw_breakpoint.c"
 grep -q 'gh_hwbp_direct_disarm' "$common/arch/arm64/kernel/hw_breakpoint.c"
 grep -q 'gh_hwbp_direct_read_trace' "$common/arch/arm64/kernel/hw_breakpoint.c"
+grep -q 'ss_conflicted' "$common/arch/arm64/kernel/hw_breakpoint.c"
 test -f "$common/include/linux/ghosthook.h"
 printf 'GhostHook explicit router stack applied to %s\n' "$actual"
