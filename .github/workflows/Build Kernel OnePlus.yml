@@ -272,7 +272,16 @@ jobs:
             done
             return 1
           }
-          if ! check_repo "${REPOS["OnePlusOSS"]}"; then
+          # A caller-supplied manifest is an explicit source pin request.
+          # Prefer it over the moving vendor branch, then retain the normal
+          # official/appendix fallback for ordinary builds.
+          if [[ -n "$DYNAMIC_REPO_INPUT" && "$DYNAMIC_REPO_INPUT" != "OnePlusOSS" ]]; then
+            if ! check_repo "${REPOS["Dynamic"]}"; then
+              if ! check_repo "${REPOS["OnePlusOSS"]}"; then
+                check_repo "${REPOS["Appendix"]}"
+              fi
+            fi
+          elif ! check_repo "${REPOS["OnePlusOSS"]}"; then
             if ! check_repo "${REPOS["Dynamic"]}"; then
               check_repo "${REPOS["Appendix"]}"
             fi
@@ -290,8 +299,16 @@ jobs:
           echo "解析 FILE 获取 CPU 和 ANDROID_VERSION..."
           # 提取 CPU
           CPU=$(echo "$REVISION" | sed -E 's#^(oneplus|realme|oppo)/([^_]+).*#\2#')
+          [[ "$CPU" == "$REVISION" ]] && CPU=""
           # 提取 ANDROID_VERSION
           ANDROID_VERSION=$(echo "$REVISION" | grep -oP '\d+\.\d+(\.\d+)?')
+          # Pinned manifests use immutable commit IDs as project revisions.
+          # Read explicit metadata when those IDs cannot encode CPU/version.
+          if [[ -z "$CPU" || -z "$ANDROID_VERSION" ]]; then
+            MANIFEST_META=$(grep -m1 'action-build:' "$XML_PATH" || true)
+            [[ -z "$CPU" ]] && CPU=$(sed -nE 's/.*cpu=([A-Za-z0-9_-]+).*/\1/p' <<< "$MANIFEST_META")
+            [[ -z "$ANDROID_VERSION" ]] && ANDROID_VERSION=$(sed -nE 's/.*android_version=([0-9]+\.[0-9]+(\.[0-9]+)?).*/\1/p' <<< "$MANIFEST_META")
+          fi
           if [[ -n "$CPU" && -n "$ANDROID_VERSION" ]]; then
             echo "✅ CPU=$CPU, ANDROID_VERSION=$ANDROID_VERSION"
             echo "CPU=$CPU" >> $GITHUB_ENV
