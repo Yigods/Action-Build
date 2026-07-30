@@ -1,0 +1,134 @@
+From 7d7a6a60118ghosthook Mon Sep 17 00:00:00 2001
+From: no_trace <no_trace@local>
+Date: Thu, 30 Jul 2026 22:00:00 +0800
+Subject: [PATCH] arm64: add explicit GhostHook fault-router registration point
+
+This is an opt-in bridge for KPM experiments. It avoids entry-text inline
+hooking of do_mem_abort: a KPM registers a callback, and the dispatcher calls
+it before normal fault_info handling. A callback must return false for every
+fault it does not explicitly own. Unregistration waits for an RCU grace period
+before KPM code may unload.
+
+The callback callsite is __nocfi because a KPM callback is not a normal Linux
+module CFI target. This only applies to the deliberately registered callback.
+---
+--- /dev/null
++++ b/include/linux/ghosthook.h
+@@ -0,0 +1,23 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _LINUX_GHOSTHOOK_H
++#define _LINUX_GHOSTHOOK_H
++
++#include <linux/types.h>
++
++struct pt_regs;
++
++/*
++ * Return true only when the callback has completely consumed the exception
++ * (for example, it has installed a valid replacement EL0 PC). Returning false
++ * preserves the unmodified arm64 fault path.
++ *
++ * Callbacks execute in the do_mem_abort exception context: no allocation,
++ * no sleeping lock, no userspace copy, and no unbounded work is permitted.
++ */
++typedef bool (*gh_fault_router_fn_t)(unsigned long far, unsigned long esr,
++				     struct pt_regs *regs, void *context);
++
++int gh_fault_router_register(gh_fault_router_fn_t fn, void *context);
++int gh_fault_router_unregister(gh_fault_router_fn_t fn, void *context);
++
++#endif /* _LINUX_GHOSTHOOK_H */
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -10,7 +10,10 @@
+ #include <linux/acpi.h>
+ #include <linux/bitfield.h>
+ #include <linux/extable.h>
++#include <linux/ghosthook.h>
+ #include <linux/kfence.h>
++#include <linux/mutex.h>
++#include <linux/rcupdate.h>
+ #include <linux/signal.h>
+ #include <linux/mm.h>
+ #include <linux/hardirq.h>
+@@ -858,11 +861,78 @@
+ 	{ do_bad,		SIGKILL, SI_KERNEL,	"unknown 63"			},
+ };
+ 
++struct gh_fault_router_binding {
++	gh_fault_router_fn_t fn;
++	void *context;
++};
++
++static DEFINE_MUTEX(gh_fault_router_lock);
++static struct gh_fault_router_binding gh_fault_router_binding;
++static struct gh_fault_router_binding __rcu *gh_fault_router_current;
++
++int gh_fault_router_register(gh_fault_router_fn_t fn, void *context)
++{
++	int ret = 0;
++
++	if (!fn)
++		return -EINVAL;
++	mutex_lock(&gh_fault_router_lock);
++	if (rcu_access_pointer(gh_fault_router_current)) {
++		ret = -EBUSY;
++		goto out;
++	}
++	WRITE_ONCE(gh_fault_router_binding.fn, fn);
++	WRITE_ONCE(gh_fault_router_binding.context, context);
++	rcu_assign_pointer(gh_fault_router_current, &gh_fault_router_binding);
++out:
++	mutex_unlock(&gh_fault_router_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(gh_fault_router_register);
++
++int gh_fault_router_unregister(gh_fault_router_fn_t fn, void *context)
++{
++	int ret = 0;
++
++	mutex_lock(&gh_fault_router_lock);
++	if (rcu_access_pointer(gh_fault_router_current) != &gh_fault_router_binding ||
++	    READ_ONCE(gh_fault_router_binding.fn) != fn ||
++	    READ_ONCE(gh_fault_router_binding.context) != context) {
++		ret = -ENOENT;
++		goto out;
++	}
++	RCU_INIT_POINTER(gh_fault_router_current, NULL);
++	synchronize_rcu();
++	WRITE_ONCE(gh_fault_router_binding.fn, NULL);
++	WRITE_ONCE(gh_fault_router_binding.context, NULL);
++out:
++	mutex_unlock(&gh_fault_router_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(gh_fault_router_unregister);
++
++static bool __nocfi gh_fault_router_dispatch(unsigned long far,
++		unsigned long esr, struct pt_regs *regs)
++{
++	struct gh_fault_router_binding *binding;
++	bool consumed = false;
++
++	rcu_read_lock();
++	binding = rcu_dereference(gh_fault_router_current);
++	if (binding)
++		consumed = binding->fn(far, esr, regs, binding->context);
++	rcu_read_unlock();
++	return consumed;
++}
++
+ void do_mem_abort(unsigned long far, unsigned long esr, struct pt_regs *regs)
+ {
+ 	const struct fault_info *inf = esr_to_fault_info(esr);
+ 	unsigned long addr = untagged_addr(far);
+ 
++	if (gh_fault_router_dispatch(far, esr, regs))
++		return;
++
+ 	if (!inf->fn(far, esr, regs))
+ 		return;
+ 
+-- 
+2.43.0

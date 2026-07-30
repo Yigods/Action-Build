@@ -81,6 +81,11 @@ on:
           - KPM
           - KPN
           - N/A
+      GH_GHOSTHOOK_ROUTER_6118:
+        type: boolean
+        description: "GhostHook: pin PKG110 6.1.118 source and add explicit fault router (test-only)"
+        required: true
+        default: false
       SUSFS_META:
         type: string
         description: "回退SUSFS(输入哈希或次数或-1关闭)//Rollback SUSFS (Enter commit hash, count, or -1 to disable)"
@@ -459,6 +464,31 @@ jobs:
           repo init -u "$BASE_URL" -b "$MANIFEST_BRANCH" -m "${FILE}.xml" --depth=1 --no-clone-bundle --no-tags
           sed -i -e '/prebuilts\/asuite"/{/ks-kernel\.lnx\.5\.0\.r3-rel/d}' -e '/tools\/tradefederation\/prebuilts"/{/ks-kernel\.lnx\.5\.0\.r3-rel/d}' ".repo/manifests/${FILE}.xml"
           repo sync -c -j$(nproc) --no-clone-bundle --no-tags --force-sync
+
+          # This opt-in path deliberately reproduces the source tuple used by
+          # the known-good PKG110 6.1.118 KPM image. Do not relax these exact
+          # hashes: the adjacent patch refuses a different common tree.
+          if [ "${{ github.event.inputs.GH_GHOSTHOOK_ROUTER_6118 }}" = "true" ]; then
+            [ "$FILE" = "oneplus_ace5_b" ] || {
+              echo "GhostHook router is reviewed only for oneplus_ace5_b" >&2
+              exit 20
+            }
+            pin_repo() {
+              dir="$1"; expected="$2"; label="$3"
+              [ -d "$dir/.git" ] || { echo "missing git worktree: $dir" >&2; exit 21; }
+              git -C "$dir" fetch --depth=1 origin "$expected"
+              actual=$(git -C "$dir" rev-parse FETCH_HEAD)
+              [ "$actual" = "$expected" ] || {
+                echo "$label resolved $actual, expected $expected" >&2; exit 22
+              }
+              git -C "$dir" checkout --detach "$actual"
+            }
+            pin_repo "$PWD"  cc77e10a4c9de81d7523313771e327b8d7d949ab modules
+            pin_repo "$PWD/kernel_platform/common" 8a82a099c89b90b54c8698db456ab8cf9a25b14e common
+            pin_repo "$PWD/kernel_platform/msm-kernel" 9c349a72a250c9bfdc3360cc2a549c2c2d133fc6 msm
+            "$GITHUB_WORKSPACE/patches/ghosthook/apply_explicit_router.sh" \
+              "$PWD/kernel_platform/common"
+          fi
 
           KERNEL_REPOS=""
           KERNEL_REPOS_PATH=$(find . -type f -name "build.config.msm.common" | head -n 1)
