@@ -751,7 +751,14 @@ jobs:
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/KernelSU"
-          patch -p1 --forward < "$GITHUB_WORKSPACE/patches/sukisu/sulog-non-susfs-user-arg.patch"
+          # The affected builtin revision defines USER_ARG_NULL as a pointer.
+          # Older, explicitly pinned v4.1.3 revisions use NULL directly and
+          # must not receive this context-specific patch.
+          if grep -Fq '#define USER_ARG_NULL user_arg_null_ptr()' kernel/sulog/event.c; then
+            patch -p1 --forward < "$GITHUB_WORKSPACE/patches/sukisu/sulog-non-susfs-user-arg.patch"
+          else
+            echo "SukiSU sulog ABI patch not needed for the selected revision"
+          fi
 
       - name: Apply Fake Patches
         if: ${{ github.event.inputs.SUSFS_META != '-1' }}
