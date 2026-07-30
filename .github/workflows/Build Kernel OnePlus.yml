@@ -303,7 +303,7 @@ jobs:
             CPU=""
           fi
           # 提取 ANDROID_VERSION
-          ANDROID_VERSION=$(echo "$REVISION" | grep -oP '\d+\.\d+(\.\d+)?')
+          ANDROID_VERSION=$(echo "$REVISION" | grep -oP '\d+\.\d+(\.\d+)?' || true)
           # Pinned manifests use immutable commit IDs as project revisions.
           # Read explicit metadata when those IDs cannot encode CPU/version.
           if [[ -z "$CPU" || -z "$ANDROID_VERSION" ]]; then
