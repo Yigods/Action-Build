@@ -194,6 +194,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v6
+        with:
+          # workflow_dispatch may otherwise check the default branch even when
+          # this workflow itself was selected from a feature branch.
+          ref: ${{ github.ref }}
 
       - name: Maximize Build Space
         if: ${{ github.event.inputs.SPACE_NOCLEAN == 'false' }}
