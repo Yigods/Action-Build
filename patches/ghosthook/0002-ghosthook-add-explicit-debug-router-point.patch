@@ -1,0 +1,146 @@
+From 7d7a6a60118ghosthook Mon Sep 17 00:00:00 2001
+From: no_trace <no_trace@local>
+Date: Fri, 31 Jul 2026 03:20:00 +0800
+Subject: [PATCH] arm64: add explicit GhostHook EL0 debug-router point
+
+Add a separately registered router at the arm64 EL0 debug-exception delivery
+point. It is intentionally only a callback lifetime/delivery primitive: this
+does not program debug registers, create a hardware breakpoint, or implement
+single-step tracing. A callback must consume only events that it fully emulates
+and return false for all others.
+
+Like the fault router, dispatch and KPM unload are protected by a raw spinlock.
+KPM unload runs under the loader RCU read-side section, so synchronize_rcu()
+would self-deadlock there. The callback runs with IRQs and preemption disabled;
+it must be O(1), non-sleeping, allocation-free and must not copy to userspace.
+---
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -914,6 +914,76 @@
+ }
+ EXPORT_SYMBOL_GPL(gh_fault_router_unregister);
+ 
++/*
++ * Debug exceptions enter with IRQs disabled and preemption disabled. Keep the
++ * registered callback serialized with its KPM unload using the same raw-lock
++ * lifetime rule as the EL0 fault router; never wait for an RCU grace period
++ * here, because KPM exit itself runs in the loader RCU read-side section.
++ */
++struct gh_debug_router_binding {
++	gh_debug_router_fn_t fn;
++	void *context;
++};
++
++static DEFINE_RAW_SPINLOCK(gh_debug_router_lock);
++static struct gh_debug_router_binding gh_debug_router_binding;
++
++int gh_debug_router_register(gh_debug_router_fn_t fn, void *context)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	if (!fn)
++		return -EINVAL;
++
++	raw_spin_lock_irqsave(&gh_debug_router_lock, flags);
++	if (READ_ONCE(gh_debug_router_binding.fn))
++		ret = -EBUSY;
++	else {
++		WRITE_ONCE(gh_debug_router_binding.context, context);
++		WRITE_ONCE(gh_debug_router_binding.fn, fn);
++	}
++	raw_spin_unlock_irqrestore(&gh_debug_router_lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(gh_debug_router_register);
++
++int gh_debug_router_unregister(gh_debug_router_fn_t fn, void *context)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	raw_spin_lock_irqsave(&gh_debug_router_lock, flags);
++	if (READ_ONCE(gh_debug_router_binding.fn) != fn ||
++	    READ_ONCE(gh_debug_router_binding.context) != context)
++		ret = -ENOENT;
++	else {
++		/* A dispatch cannot still be in KPM callback code under this lock. */
++		WRITE_ONCE(gh_debug_router_binding.fn, NULL);
++		WRITE_ONCE(gh_debug_router_binding.context, NULL);
++	}
++	raw_spin_unlock_irqrestore(&gh_debug_router_lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(gh_debug_router_unregister);
++
++static bool __nocfi gh_debug_router_dispatch(unsigned long addr_if_watchpoint,
++		unsigned long esr, struct pt_regs *regs)
++{
++	unsigned long flags;
++	gh_debug_router_fn_t fn;
++	void *context;
++	bool consumed = false;
++
++	raw_spin_lock_irqsave(&gh_debug_router_lock, flags);
++	fn = READ_ONCE(gh_debug_router_binding.fn);
++	context = READ_ONCE(gh_debug_router_binding.context);
++	if (fn)
++		consumed = fn(addr_if_watchpoint, esr, regs, context);
++	raw_spin_unlock_irqrestore(&gh_debug_router_lock, flags);
++	return consumed;
++}
++
+ static bool __nocfi gh_fault_router_dispatch(unsigned long far,
+ 		unsigned long esr, struct pt_regs *regs)
+ {
+@@ -1021,16 +1091,25 @@
+ {
+ 	const struct fault_info *inf = esr_to_debug_fault_info(esr);
+ 	unsigned long pc = instruction_pointer(regs);
++	bool from_el0 = user_mode(regs);
+ 
+ 	debug_exception_enter(regs);
+ 
+-	if (user_mode(regs) && !is_ttbr0_addr(pc))
++	if (from_el0 && !is_ttbr0_addr(pc))
+ 		arm64_apply_bp_hardening();
+ 
+-	if (inf->fn(addr_if_watchpoint, esr, regs)) {
++	/*
++	 * The debug router is deliberately EL0-only. KPM callbacks may consume
++	 * only an event they fully emulate (for example by fixing regs->pc); a
++	 * false return retains the unmodified debug_fault_info path below.
++	 */
++	if (from_el0 && gh_debug_router_dispatch(addr_if_watchpoint, esr, regs))
++		goto out;
++
++	if (inf->fn(addr_if_watchpoint, esr, regs))
+ 		arm64_notify_die(inf->name, regs, inf->sig, inf->code, pc, esr);
+-	}
+ 
++out:
+ 	debug_exception_exit(regs);
+ }
+ NOKPROBE_SYMBOL(do_debug_exception);
+--- a/include/linux/ghosthook.h
++++ b/include/linux/ghosthook.h
+@@ -20,4 +20,17 @@
+ int gh_fault_router_register(gh_fault_router_fn_t fn, void *context);
+ int gh_fault_router_unregister(gh_fault_router_fn_t fn, void *context);
+ 
++/*
++ * EL0 hardware-breakpoint, single-step and watchpoint delivery point. The
++ * callback runs after debug_exception_enter(), with IRQs disabled and
++ * preemption disabled. It therefore has the same non-sleeping/O(1) contract
++ * as gh_fault_router_fn_t, and must return false for every event it does not
++ * completely emulate.
++ */
++typedef bool (*gh_debug_router_fn_t)(unsigned long addr_if_watchpoint,
++			     unsigned long esr, struct pt_regs *regs, void *context);
++
++int gh_debug_router_register(gh_debug_router_fn_t fn, void *context);
++int gh_debug_router_unregister(gh_debug_router_fn_t fn, void *context);
++
+ #endif /* _LINUX_GHOSTHOOK_H */
+-- 
+2.43.0

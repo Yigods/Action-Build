@@ -1,5 +1,5 @@
 #!/usr/bin/env sh
-# Apply the GhostHook router only to the source baseline it was reviewed on.
+# Apply the GhostHook router stack only to the source baseline it was reviewed on.
 # Usage: apply_explicit_router.sh /path/to/kernel_platform/common
 set -eu
 
@@ -16,10 +16,17 @@ git -C "$common" diff --quiet || {
     echo "refusing: common worktree is dirty" >&2
     exit 4
 }
-git -C "$common" apply --check "$self_dir/0001-ghosthook-add-explicit-fault-router-point.patch"
-git -C "$common" apply "$self_dir/0001-ghosthook-add-explicit-fault-router-point.patch"
+for patch in \
+    "$self_dir/0001-ghosthook-add-explicit-fault-router-point.patch" \
+    "$self_dir/0002-ghosthook-add-explicit-debug-router-point.patch"; do
+    [ -f "$patch" ] || { echo "missing patch: $patch" >&2; exit 5; }
+    git -C "$common" apply --check "$patch"
+    git -C "$common" apply "$patch"
+done
 git -C "$common" diff --check
 grep -q 'gh_fault_router_register' "$common/arch/arm64/mm/fault.c"
 grep -q 'gh_fault_router_unregister' "$common/arch/arm64/mm/fault.c"
+grep -q 'gh_debug_router_register' "$common/arch/arm64/mm/fault.c"
+grep -q 'gh_debug_router_unregister' "$common/arch/arm64/mm/fault.c"
 test -f "$common/include/linux/ghosthook.h"
-printf 'GhostHook explicit router patch applied to %s\n' "$actual"
+printf 'GhostHook explicit router stack applied to %s\n' "$actual"
