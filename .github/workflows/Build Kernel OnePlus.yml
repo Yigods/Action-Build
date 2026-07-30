@@ -724,6 +724,14 @@ jobs:
           grep -nE '^(REPO_OWNER|REPO_NAME|REPO_BRANCH|KSU_VERSION_API|KSU_VERSION_FULL|VERSION_TAG|GIT_BIN|CURL_BIN)' kernel/Makefile
           echo "::endgroup::"
 
+      # SukiSU builtin b1d534bc passes a pointer where non-SUSFS kernels require
+      # a struct user_arg_ptr value.  Keep the SUSFS pointer ABI unchanged.
+      - name: Fix SukiSU sulog non-SUSFS build ABI
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/kernel_workspace/kernel_platform/KernelSU"
+          patch -p1 --forward < "$GITHUB_WORKSPACE/patches/sukisu/sulog-non-susfs-user-arg.patch"
+
       - name: Apply Fake Patches
         if: ${{ github.event.inputs.SUSFS_META != '-1' }}
         run: |
