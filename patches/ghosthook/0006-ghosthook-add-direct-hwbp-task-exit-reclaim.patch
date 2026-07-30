@@ -1,0 +1,96 @@
+diff --git a/include/linux/ghosthook.h b/include/linux/ghosthook.h
+index d87b64a..c35e9c0
+--- a/include/linux/ghosthook.h
++++ b/include/linux/ghosthook.h
+@@ -5,6 +5,7 @@
+ #include <linux/types.h>
+ 
+ struct pt_regs;
++struct task_struct;
+ 
+ /*
+  * Return true only when the callback has completely consumed the exception
+@@ -63,5 +64,7 @@ int gh_hwbp_direct_read_trace(int cpu, unsigned long *cursor,
+ 			      struct gh_hwbp_direct_trace *records,
+ 			      unsigned int max_records, unsigned int *copied,
+ 			      unsigned long *dropped);
++/* Called by do_exit() while the exiting task is still current on its CPU. */
++void gh_hwbp_direct_task_exit(struct task_struct *task);
+ 
+ #endif /* _LINUX_GHOSTHOOK_H */
+diff --git a/arch/arm64/kernel/hw_breakpoint.c b/arch/arm64/kernel/hw_breakpoint.c
+index 9b90ef6..3ce1013
+--- a/arch/arm64/kernel/hw_breakpoint.c
++++ b/arch/arm64/kernel/hw_breakpoint.c
+@@ -361,6 +361,50 @@ int gh_hwbp_direct_disarm(pid_t tid)
+ }
+ EXPORT_SYMBOL_GPL(gh_hwbp_direct_disarm);
+ 
++/*
++ * The retained struct pid prevents reuse, but it must not keep the final BRP
++ * slot reserved after the target has gone away.  do_exit() calls this while
++ * the task is still current, so clearing this CPU's direct BCR is sufficient:
++ * a task cannot execute concurrently on another CPU.  Do not call the normal
++ * disarm path here; on_each_cpu() and any sleeping operation are inappropriate
++ * in task teardown.
++ */
++void gh_hwbp_direct_task_exit(struct task_struct *task)
++{
++	struct pid *owned = NULL;
++	unsigned long flags;
++
++	if (task != current)
++		return;
++
++	raw_spin_lock_irqsave(&gh_hwbp_direct_lock, flags);
++	if (!gh_hwbp_direct.active || !gh_hwbp_direct_task_matches(task))
++		goto out;
++
++	write_wb_reg(AARCH64_DBG_REG_BCR, gh_hwbp_direct.slot, 0);
++	if (this_cpu_read(gh_hwbp_direct_cpu_enabled)) {
++		disable_debug_monitors(DBG_ACTIVE_EL0);
++		this_cpu_write(gh_hwbp_direct_cpu_enabled, false);
++	}
++	if (gh_hwbp_direct.ss_owned)
++		user_disable_single_step(task);
++	owned = gh_hwbp_direct.pid;
++	gh_hwbp_direct.pid = NULL;
++	gh_hwbp_direct.pc = 0;
++	gh_hwbp_direct.hits = 0;
++	gh_hwbp_direct.slot = -1;
++	gh_hwbp_direct.last_cpu = -1;
++	gh_hwbp_direct.stepping = false;
++	gh_hwbp_direct.ss_owned = false;
++	gh_hwbp_direct.ss_conflicted = false;
++	gh_hwbp_direct.disarming = false;
++	gh_hwbp_direct.active = false;
++out:
++	raw_spin_unlock_irqrestore(&gh_hwbp_direct_lock, flags);
++	if (owned)
++		put_pid(owned);
++}
++
+ int gh_hwbp_direct_get_stats(struct gh_hwbp_direct_stats *stats)
+ {
+ 	unsigned long flags;
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 7dded98..04d0db7
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -68,6 +68,7 @@
+ #include <linux/kprobes.h>
+ #include <linux/rethook.h>
+ #include <linux/sysfs.h>
++#include <linux/ghosthook.h>
+ 
+ #include <linux/uaccess.h>
+ #include <asm/unistd.h>
+@@ -829,6 +830,8 @@ void __noreturn do_exit(long code)
+ 
+ 	io_uring_files_cancel();
+ 	exit_signals(tsk);  /* sets PF_EXITING */
++	/* Release a direct GhostHook BRP before this task's mm disappears. */
++	gh_hwbp_direct_task_exit(tsk);
+ 
+ 	trace_android_vh_exit_check(current);
+ 
