@@ -1,0 +1,187 @@
+diff --git a/arch/arm64/kernel/hw_breakpoint.c b/arch/arm64/kernel/hw_breakpoint.c
+index 89042d7..b51d4ba 100644
+--- a/arch/arm64/kernel/hw_breakpoint.c
++++ b/arch/arm64/kernel/hw_breakpoint.c
+@@ -57,14 +57,25 @@ struct gh_hwbp_direct_state {
+ 	unsigned long pc;
+ 	unsigned long hits;
+ 	int slot;
++	int last_cpu;
+ 	bool active;
+ 	bool disarming;
+ 	bool stepping;
+ };
+ 
++#define GH_HWBP_DIRECT_TRACE_CAP 64
++
++struct gh_hwbp_direct_trace_ring {
++	unsigned long head;
++	unsigned long tail;
++	unsigned long dropped;
++	struct gh_hwbp_direct_trace records[GH_HWBP_DIRECT_TRACE_CAP];
++};
++
+ static DEFINE_RAW_SPINLOCK(gh_hwbp_direct_lock);
+ static struct gh_hwbp_direct_state gh_hwbp_direct;
+ static DEFINE_PER_CPU(bool, gh_hwbp_direct_cpu_enabled);
++static DEFINE_PER_CPU(struct gh_hwbp_direct_trace_ring, gh_hwbp_direct_trace);
+ static bool gh_hwbp_direct_router_ready;
+ 
+ static bool gh_hwbp_direct_task_matches(struct task_struct *task)
+@@ -123,6 +134,47 @@ static void gh_hwbp_direct_sync_current(void *unused)
+ 	gh_hwbp_direct_sync_task(current);
+ }
+ 
++static void gh_hwbp_direct_reset_trace_current(void *unused)
++{
++	struct gh_hwbp_direct_trace_ring *ring;
++
++	(void)unused;
++	ring = this_cpu_ptr(&gh_hwbp_direct_trace);
++	ring->head = 0;
++	ring->tail = 0;
++	ring->dropped = 0;
++}
++
++/* Called under gh_hwbp_direct_lock in IRQ-disabled exception context. */
++static void gh_hwbp_direct_record_trace(struct pt_regs *regs)
++{
++	struct gh_hwbp_direct_trace_ring *ring;
++	struct gh_hwbp_direct_trace *record;
++	unsigned long sequence;
++	int i;
++	int cpu = raw_smp_processor_id();
++
++	ring = this_cpu_ptr(&gh_hwbp_direct_trace);
++	sequence = ++ring->head;
++	if (!ring->tail)
++		ring->tail = sequence;
++	else if (sequence - ring->tail >= GH_HWBP_DIRECT_TRACE_CAP) {
++		ring->tail++;
++		ring->dropped++;
++	}
++
++	record = &ring->records[(sequence - 1) % GH_HWBP_DIRECT_TRACE_CAP];
++	record->sequence = sequence;
++	record->tid = pid_nr(gh_hwbp_direct.pid);
++	record->cpu = cpu;
++	record->pc = instruction_pointer(regs);
++	record->sp = regs->sp;
++	record->pstate = regs->pstate;
++	for (i = 0; i < GH_HWBP_DIRECT_TRACE_GPRS; i++)
++		record->regs[i] = regs->regs[i];
++	gh_hwbp_direct.last_cpu = cpu;
++}
++
+ static bool gh_hwbp_direct_debug_event(unsigned long addr_if_watchpoint,
+ 		unsigned long esr, struct pt_regs *regs, void *context)
+ {
+@@ -147,6 +199,7 @@ static bool gh_hwbp_direct_debug_event(unsigned long addr_if_watchpoint,
+ 		/* Disable this exact BRP, execute one original instruction, rearm. */
+ 		write_wb_reg(AARCH64_DBG_REG_BCR, gh_hwbp_direct.slot, 0);
+ 		gh_hwbp_direct.hits++;
++		gh_hwbp_direct_record_trace(regs);
+ 		gh_hwbp_direct.stepping = true;
+ 		user_enable_single_step(current);
+ 		consumed = true;
+@@ -213,12 +266,14 @@ int gh_hwbp_direct_arm(pid_t tid, unsigned long pc)
+ 	gh_hwbp_direct.pc = pc;
+ 	gh_hwbp_direct.hits = 0;
+ 	gh_hwbp_direct.slot = slot;
++	gh_hwbp_direct.last_cpu = -1;
+ 	gh_hwbp_direct.disarming = false;
+ 	gh_hwbp_direct.stepping = false;
+ 	gh_hwbp_direct.active = true;
+ 	raw_spin_unlock_irqrestore(&gh_hwbp_direct_lock, flags);
+ 
+ 	/* Install immediately if the TID is currently running, else at switch-in. */
++	on_each_cpu(gh_hwbp_direct_reset_trace_current, NULL, 1);
+ 	on_each_cpu(gh_hwbp_direct_sync_current, NULL, 1);
+ 	put_task_struct(task);
+ 	return 0;
+@@ -260,6 +315,7 @@ int gh_hwbp_direct_disarm(pid_t tid)
+ 	gh_hwbp_direct.pc = 0;
+ 	gh_hwbp_direct.hits = 0;
+ 	gh_hwbp_direct.slot = -1;
++	gh_hwbp_direct.last_cpu = -1;
+ 	gh_hwbp_direct.stepping = false;
+ 	gh_hwbp_direct.disarming = false;
+ 	gh_hwbp_direct.active = false;
+@@ -282,12 +338,44 @@ int gh_hwbp_direct_get_stats(struct gh_hwbp_direct_stats *stats)
+ 	stats->tid = gh_hwbp_direct.pid ? pid_nr(gh_hwbp_direct.pid) : 0;
+ 	stats->pc = gh_hwbp_direct.pc;
+ 	stats->hits = gh_hwbp_direct.hits;
++	stats->last_cpu = gh_hwbp_direct.last_cpu;
+ 	stats->armed = gh_hwbp_direct.active && !gh_hwbp_direct.disarming;
+ 	raw_spin_unlock_irqrestore(&gh_hwbp_direct_lock, flags);
+ 	return 0;
+ }
+ EXPORT_SYMBOL_GPL(gh_hwbp_direct_get_stats);
+ 
++int gh_hwbp_direct_read_trace(int cpu, unsigned long *cursor,
++			      struct gh_hwbp_direct_trace *records,
++			      unsigned int max_records, unsigned int *copied,
++			      unsigned long *dropped)
++{
++	struct gh_hwbp_direct_trace_ring *ring;
++	unsigned long flags;
++	unsigned long next;
++	unsigned int count = 0;
++
++	if (cpu < 0 || cpu >= nr_cpu_ids || !cursor || !records ||
++	    !max_records || !copied || !dropped)
++		return -EINVAL;
++
++	raw_spin_lock_irqsave(&gh_hwbp_direct_lock, flags);
++	ring = per_cpu_ptr(&gh_hwbp_direct_trace, cpu);
++	next = *cursor;
++	if (!next || (ring->tail && next < ring->tail))
++		next = ring->tail;
++	while (next && next <= ring->head && count < max_records) {
++		records[count++] = ring->records[(next - 1) % GH_HWBP_DIRECT_TRACE_CAP];
++		next++;
++	}
++	*cursor = next;
++	*copied = count;
++	*dropped = ring->dropped;
++	raw_spin_unlock_irqrestore(&gh_hwbp_direct_lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(gh_hwbp_direct_read_trace);
++
+ int hw_breakpoint_slots(int type)
+ {
+ 	/*
+diff --git a/include/linux/ghosthook.h b/include/linux/ghosthook.h
+index 7a1eed0..d87b64a 100644
+--- a/include/linux/ghosthook.h
++++ b/include/linux/ghosthook.h
+@@ -40,11 +40,28 @@ struct gh_hwbp_direct_stats {
+ 	pid_t tid;
+ 	unsigned long pc;
+ 	unsigned long hits;
++	int last_cpu;
+ 	int armed;
+ };
+ 
++/* Fixed-size records are written by the kernel-owned HWBP exception path. */
++#define GH_HWBP_DIRECT_TRACE_GPRS 31
++struct gh_hwbp_direct_trace {
++	unsigned long sequence;
++	pid_t tid;
++	u32 cpu;
++	unsigned long pc;
++	unsigned long sp;
++	unsigned long pstate;
++	unsigned long regs[GH_HWBP_DIRECT_TRACE_GPRS];
++};
++
+ int gh_hwbp_direct_arm(pid_t tid, unsigned long pc);
+ int gh_hwbp_direct_disarm(pid_t tid);
+ int gh_hwbp_direct_get_stats(struct gh_hwbp_direct_stats *stats);
++int gh_hwbp_direct_read_trace(int cpu, unsigned long *cursor,
++			      struct gh_hwbp_direct_trace *records,
++			      unsigned int max_records, unsigned int *copied,
++			      unsigned long *dropped);
+ 
+ #endif /* _LINUX_GHOSTHOOK_H */
