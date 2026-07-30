@@ -493,7 +493,7 @@ jobs:
             # workflow_dispatch can execute a selected workflow file while
             # actions/checkout still supplies the repository default tree.
             # Fetch the reviewed patch stack from its immutable content commit.
-            GH_PATCH_REF=d1731576966742b2a4a311d89918aa89ec31eb3e
+            GH_PATCH_REF=f57519565abc7d017b9a8e3a92a72f7468eadc26
             GH_PATCH_BASE="https://raw.githubusercontent.com/Yigods/Action-Build/${GH_PATCH_REF}/patches/ghosthook"
             GH_PATCH_DIR="$PWD/.ghosthook-router-patch"
             mkdir -p "$GH_PATCH_DIR"
@@ -512,6 +512,9 @@ jobs:
             curl --fail --location --silent --show-error \
               "$GH_PATCH_BASE/0005-ghosthook-add-direct-hwbp-ss-conflict-guard.patch" \
               -o "$GH_PATCH_DIR/0005-ghosthook-add-direct-hwbp-ss-conflict-guard.patch"
+            curl --fail --location --silent --show-error \
+              "$GH_PATCH_BASE/0006-ghosthook-add-direct-hwbp-task-exit-reclaim.patch" \
+              -o "$GH_PATCH_DIR/0006-ghosthook-add-direct-hwbp-task-exit-reclaim.patch"
             curl --fail --location --silent --show-error \
               "$GH_PATCH_BASE/apply_explicit_router.sh" \
               -o "$GH_PATCH_DIR/apply_explicit_router.sh"
