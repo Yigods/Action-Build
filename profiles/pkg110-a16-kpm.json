@@ -1,0 +1,34 @@
+{
+  "description": "Minimal SukiSU Ultra KPM build profile for OnePlus Ace 5 PKG110, Android 16 source branch oneplus_ace5_b.",
+  "workflow": "Build Kernel OnePlus.yml",
+  "ref": "SukiSU-Ultra",
+  "inputs": {
+    "FILE": "oneplus_ace5_b",
+    "SUSFS_CI": "N/A",
+    "KPM": "KPM",
+    "SUSFS_META": "-1",
+    "DYNAMIC_REPO": "OnePlusOSS",
+    "BUILD_TIME": "-1",
+    "KSU_META": "main/builtin//",
+    "LZ4_UPDATE": false,
+    "ZRAM": "0/lz4kd/8589934592",
+    "SUFFIX": "nt-kpm-pkg110-a16",
+    "FAST_BUILD": false,
+    "LSM_BBG": false,
+    "NETFILTER": false,
+    "CCM": false,
+    "UNICODE_BYPASS": false,
+    "SCHED_HMBIRD": false,
+    "DROID_SPACES": false,
+    "RE_KERNEL": false,
+    "SUSFS_DEV": false,
+    "SPACE_NOCLEAN": false,
+    "BUILD_NOCACHE": true
+  },
+  "device_evidence": {
+    "model": "PKG110",
+    "android_api": 36,
+    "kernel": "6.1.118-android14-11-o-g64180ab070e5",
+    "kmi": "android14-6.1"
+  }
+}
