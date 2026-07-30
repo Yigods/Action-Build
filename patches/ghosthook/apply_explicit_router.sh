@@ -18,7 +18,8 @@ git -C "$common" diff --quiet || {
 }
 for patch in \
     "$self_dir/0001-ghosthook-add-explicit-fault-router-point.patch" \
-    "$self_dir/0002-ghosthook-add-explicit-debug-router-point.patch"; do
+    "$self_dir/0002-ghosthook-add-explicit-debug-router-point.patch" \
+    "$self_dir/0003-ghosthook-add-direct-el0-hwbp.patch"; do
     [ -f "$patch" ] || { echo "missing patch: $patch" >&2; exit 5; }
     git -C "$common" apply --check "$patch"
     git -C "$common" apply "$patch"
@@ -28,5 +29,8 @@ grep -q 'gh_fault_router_register' "$common/arch/arm64/mm/fault.c"
 grep -q 'gh_fault_router_unregister' "$common/arch/arm64/mm/fault.c"
 grep -q 'gh_debug_router_register' "$common/arch/arm64/mm/fault.c"
 grep -q 'gh_debug_router_unregister' "$common/arch/arm64/mm/fault.c"
+grep -q 'gh_debug_router_register_core' "$common/arch/arm64/mm/fault.c"
+grep -q 'gh_hwbp_direct_arm' "$common/arch/arm64/kernel/hw_breakpoint.c"
+grep -q 'gh_hwbp_direct_disarm' "$common/arch/arm64/kernel/hw_breakpoint.c"
 test -f "$common/include/linux/ghosthook.h"
 printf 'GhostHook explicit router stack applied to %s\n' "$actual"
