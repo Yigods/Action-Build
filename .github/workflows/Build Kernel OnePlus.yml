@@ -492,8 +492,8 @@ jobs:
             pin_repo "$PWD/kernel_platform/msm-kernel" 9c349a72a250c9bfdc3360cc2a549c2c2d133fc6 msm
             # workflow_dispatch can execute a selected workflow file while
             # actions/checkout still supplies the repository default tree.
-            # Fetch the reviewed patch pair from its immutable commit.
-            GH_PATCH_REF=56fdd2e67be0c8e63151fe64fac72cb5ee3c5142
+            # Fetch the reviewed patch stack from its immutable content commit.
+            GH_PATCH_REF=6dd090de4fdbde9745d11d111a8f93661b10d6cc
             GH_PATCH_BASE="https://raw.githubusercontent.com/Yigods/Action-Build/${GH_PATCH_REF}/patches/ghosthook"
             GH_PATCH_DIR="$PWD/.ghosthook-router-patch"
             mkdir -p "$GH_PATCH_DIR"
@@ -503,6 +503,9 @@ jobs:
             curl --fail --location --silent --show-error \
               "$GH_PATCH_BASE/0002-ghosthook-add-explicit-debug-router-point.patch" \
               -o "$GH_PATCH_DIR/0002-ghosthook-add-explicit-debug-router-point.patch"
+            curl --fail --location --silent --show-error \
+              "$GH_PATCH_BASE/0003-ghosthook-add-direct-el0-hwbp.patch" \
+              -o "$GH_PATCH_DIR/0003-ghosthook-add-direct-el0-hwbp.patch"
             curl --fail --location --silent --show-error \
               "$GH_PATCH_BASE/apply_explicit_router.sh" \
               -o "$GH_PATCH_DIR/apply_explicit_router.sh"
