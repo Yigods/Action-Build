@@ -6,12 +6,117 @@ Subject: [PATCH] arm64: add explicit GhostHook fault-router registration point
 This is an opt-in bridge for KPM experiments. It avoids entry-text inline
 hooking of do_mem_abort: a KPM registers a callback, and the dispatcher calls
 it before normal fault_info handling. A callback must return false for every
-fault it does not explicitly own. Unregistration waits for an RCU grace period
-before KPM code may unload.
+fault it does not explicitly own. Dispatch and unregister are serialized by a
+raw spinlock so a KPM unload never frees callback code while an exception is
+inside it; this is deliberately non-sleeping because KPM exit runs under the
+loader's RCU read-side section.
 
 The callback callsite is __nocfi because a KPM callback is not a normal Linux
 module CFI target. This only applies to the deliberately registered callback.
 ---
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index 2f63b2a86c63..3a18033665d7 100755
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -10,7 +10,9 @@
+ #include <linux/acpi.h>
+ #include <linux/bitfield.h>
+ #include <linux/extable.h>
++#include <linux/ghosthook.h>
+ #include <linux/kfence.h>
++#include <linux/spinlock.h>
+ #include <linux/signal.h>
+ #include <linux/mm.h>
+ #include <linux/hardirq.h>
+@@ -858,11 +860,85 @@ static const struct fault_info fault_info[] = {
+ 	{ do_bad,		SIGKILL, SI_KERNEL,	"unknown 63"			},
+ };
+ 
++
++struct gh_fault_router_binding {
++	gh_fault_router_fn_t fn;
++	void *context;
++};
++
++/*
++ * KPM invokes init/control/exit under its own RCU read-side section. Do not
++ * use synchronize_rcu() here: a KPM exit would self-deadlock/stall. The
++ * callback is deliberately O(1), so a raw spinlock can instead make dispatch
++ * and unregister mutually exclusive without sleeping.
++ */
++static DEFINE_RAW_SPINLOCK(gh_fault_router_lock);
++static struct gh_fault_router_binding gh_fault_router_binding;
++
++int gh_fault_router_register(gh_fault_router_fn_t fn, void *context)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	if (!fn)
++		return -EINVAL;
++
++	raw_spin_lock_irqsave(&gh_fault_router_lock, flags);
++	if (READ_ONCE(gh_fault_router_binding.fn))
++		ret = -EBUSY;
++	else {
++		WRITE_ONCE(gh_fault_router_binding.context, context);
++		WRITE_ONCE(gh_fault_router_binding.fn, fn);
++	}
++	raw_spin_unlock_irqrestore(&gh_fault_router_lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(gh_fault_router_register);
++
++int gh_fault_router_unregister(gh_fault_router_fn_t fn, void *context)
++{
++	unsigned long flags;
++	int ret = 0;
++
++	raw_spin_lock_irqsave(&gh_fault_router_lock, flags);
++	if (READ_ONCE(gh_fault_router_binding.fn) != fn ||
++	    READ_ONCE(gh_fault_router_binding.context) != context)
++		ret = -ENOENT;
++	else {
++		/* No dispatch can still be in callback code while this lock is held. */
++		WRITE_ONCE(gh_fault_router_binding.fn, NULL);
++		WRITE_ONCE(gh_fault_router_binding.context, NULL);
++	}
++	raw_spin_unlock_irqrestore(&gh_fault_router_lock, flags);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(gh_fault_router_unregister);
++
++static bool __nocfi gh_fault_router_dispatch(unsigned long far,
++		unsigned long esr, struct pt_regs *regs)
++{
++	unsigned long flags;
++	gh_fault_router_fn_t fn;
++	void *context;
++	bool consumed = false;
++
++	raw_spin_lock_irqsave(&gh_fault_router_lock, flags);
++	fn = READ_ONCE(gh_fault_router_binding.fn);
++	context = READ_ONCE(gh_fault_router_binding.context);
++	if (fn)
++		consumed = fn(far, esr, regs, context);
++	raw_spin_unlock_irqrestore(&gh_fault_router_lock, flags);
++	return consumed;
++}
++
+ void do_mem_abort(unsigned long far, unsigned long esr, struct pt_regs *regs)
+ {
+ 	const struct fault_info *inf = esr_to_fault_info(esr);
+ 	unsigned long addr = untagged_addr(far);
+ 
++	if (gh_fault_router_dispatch(far, esr, regs))
++		return;
++
+ 	if (!inf->fn(far, esr, regs))
+ 		return;
+ 
+diff --git a/include/linux/ghosthook.h b/include/linux/ghosthook.h
+new file mode 100644
+index 000000000000..20b3bddbc8ec
 --- /dev/null
 +++ b/include/linux/ghosthook.h
 @@ -0,0 +1,23 @@
@@ -38,97 +143,5 @@ module CFI target. This only applies to the deliberately registered callback.
 +int gh_fault_router_unregister(gh_fault_router_fn_t fn, void *context);
 +
 +#endif /* _LINUX_GHOSTHOOK_H */
---- a/arch/arm64/mm/fault.c
-+++ b/arch/arm64/mm/fault.c
-@@ -10,7 +10,10 @@
- #include <linux/acpi.h>
- #include <linux/bitfield.h>
- #include <linux/extable.h>
-+#include <linux/ghosthook.h>
- #include <linux/kfence.h>
-+#include <linux/mutex.h>
-+#include <linux/rcupdate.h>
- #include <linux/signal.h>
- #include <linux/mm.h>
- #include <linux/hardirq.h>
-@@ -858,11 +861,78 @@
- 	{ do_bad,		SIGKILL, SI_KERNEL,	"unknown 63"			},
- };
- 
-+struct gh_fault_router_binding {
-+	gh_fault_router_fn_t fn;
-+	void *context;
-+};
-+
-+static DEFINE_MUTEX(gh_fault_router_lock);
-+static struct gh_fault_router_binding gh_fault_router_binding;
-+static struct gh_fault_router_binding __rcu *gh_fault_router_current;
-+
-+int gh_fault_router_register(gh_fault_router_fn_t fn, void *context)
-+{
-+	int ret = 0;
-+
-+	if (!fn)
-+		return -EINVAL;
-+	mutex_lock(&gh_fault_router_lock);
-+	if (rcu_access_pointer(gh_fault_router_current)) {
-+		ret = -EBUSY;
-+		goto out;
-+	}
-+	WRITE_ONCE(gh_fault_router_binding.fn, fn);
-+	WRITE_ONCE(gh_fault_router_binding.context, context);
-+	rcu_assign_pointer(gh_fault_router_current, &gh_fault_router_binding);
-+out:
-+	mutex_unlock(&gh_fault_router_lock);
-+	return ret;
-+}
-+EXPORT_SYMBOL_GPL(gh_fault_router_register);
-+
-+int gh_fault_router_unregister(gh_fault_router_fn_t fn, void *context)
-+{
-+	int ret = 0;
-+
-+	mutex_lock(&gh_fault_router_lock);
-+	if (rcu_access_pointer(gh_fault_router_current) != &gh_fault_router_binding ||
-+	    READ_ONCE(gh_fault_router_binding.fn) != fn ||
-+	    READ_ONCE(gh_fault_router_binding.context) != context) {
-+		ret = -ENOENT;
-+		goto out;
-+	}
-+	RCU_INIT_POINTER(gh_fault_router_current, NULL);
-+	synchronize_rcu();
-+	WRITE_ONCE(gh_fault_router_binding.fn, NULL);
-+	WRITE_ONCE(gh_fault_router_binding.context, NULL);
-+out:
-+	mutex_unlock(&gh_fault_router_lock);
-+	return ret;
-+}
-+EXPORT_SYMBOL_GPL(gh_fault_router_unregister);
-+
-+static bool __nocfi gh_fault_router_dispatch(unsigned long far,
-+		unsigned long esr, struct pt_regs *regs)
-+{
-+	struct gh_fault_router_binding *binding;
-+	bool consumed = false;
-+
-+	rcu_read_lock();
-+	binding = rcu_dereference(gh_fault_router_current);
-+	if (binding)
-+		consumed = binding->fn(far, esr, regs, binding->context);
-+	rcu_read_unlock();
-+	return consumed;
-+}
-+
- void do_mem_abort(unsigned long far, unsigned long esr, struct pt_regs *regs)
- {
- 	const struct fault_info *inf = esr_to_fault_info(esr);
- 	unsigned long addr = untagged_addr(far);
- 
-+	if (gh_fault_router_dispatch(far, esr, regs))
-+		return;
-+
- 	if (!inf->fn(far, esr, regs))
- 		return;
- 
 -- 
 2.43.0
