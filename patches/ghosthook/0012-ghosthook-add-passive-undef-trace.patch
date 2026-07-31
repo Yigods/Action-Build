@@ -160,10 +160,18 @@ index 000000000000..e4bdd7090447
 +}
 +EXPORT_SYMBOL_GPL(gh_undef_trace_read);
 diff --git a/arch/arm64/kernel/traps.c b/arch/arm64/kernel/traps.c
-index 23e8822e86b4..b647b4c8752d 100644
+index 23e8822e86b4..2446484f27dd 100644
 --- a/arch/arm64/kernel/traps.c
 +++ b/arch/arm64/kernel/traps.c
-@@ -498,6 +498,7 @@ void do_undefinstr(struct pt_regs *regs, unsigned long esr)
+@@ -19,6 +19,7 @@
+ #include <linux/kexec.h>
+ #include <linux/delay.h>
+ #include <linux/init.h>
++#include <linux/ghosthook.h>
+ #include <linux/sched/signal.h>
+ #include <linux/sched/debug.h>
+ #include <linux/sched/task_stack.h>
+@@ -498,6 +499,7 @@ void do_undefinstr(struct pt_regs *regs, unsigned long esr)
  		return;
  
  	trace_android_rvh_do_undefinstr(regs, esr);
