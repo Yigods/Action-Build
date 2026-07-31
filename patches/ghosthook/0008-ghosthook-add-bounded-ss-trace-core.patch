@@ -82,6 +82,7 @@ index 0000000..90ac95b
 +#include <linux/ghosthook.h>
 +#include <linux/init.h>
 +#include <linux/pid.h>
++#include <linux/ptrace.h>
 +#include <linux/smp.h>
 +#include <linux/spinlock.h>
 +#include <linux/sched.h>
