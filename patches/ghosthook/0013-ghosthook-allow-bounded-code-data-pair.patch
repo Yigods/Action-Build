@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: no_trace <noreply@example.invalid>
+Date: Sat, 1 Aug 2026 00:00:00 +0800
+Subject: [PATCH] ghosthook: allow bounded code/data region pair per mm
+
+Permit one additional non-overlapping Ghost Region for per-thread shadow state.
+The existing API and lifecycle rules remain unchanged; the hard limit is two
+regions per mm and a third allocation fails closed with -ENOSPC.
+
+---
+ mm/gh_ghost.c | 22 ++++++++++++++--------
+ 1 file changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/mm/gh_ghost.c b/mm/gh_ghost.c
+index 0657f344d62f..d0b61c5197b1 100644
+@@ -6,7 +6,8 @@
+  * starts RW, is filled by a trusted in-kernel caller, and may be sealed once
+  * to RX.  The region registry is consulted by mmap/munmap/mprotect/mremap
+  * gates so ordinary VM operations cannot silently overlap the unmanaged leaf
+- * PTEs.  The first version permits exactly one bounded region per mm.
++ * PTEs.  Each mm may own a bounded code/data pair: a region may remain RW
++ * for trusted per-thread state while its companion transitions once to RX.
+  */
+ #include <linux/errno.h>
+ #include <linux/ghosthook.h>
+@@ -20,6 +21,7 @@
+ #include <asm/tlbflush.h>
+ 
+ #define GH_GHOST_MAX_PAGES	16UL
++#define GH_GHOST_MAX_REGIONS_PER_MM	2UL
+ 
+ struct gh_ghost_region {
+ 	struct list_head node;
+@@ -75,14 +77,15 @@
+ 	return NULL;
+ }
+ 
+-static bool gh_ghost_mm_has_region_locked(struct mm_struct *mm)
++static unsigned long gh_ghost_mm_region_count_locked(struct mm_struct *mm)
+ {
+ 	struct gh_ghost_region *region;
++	unsigned long count = 0;
+ 
+ 	list_for_each_entry(region, &gh_ghost_regions, node)
+ 		if (region->mm == mm)
+-			return true;
+-	return false;
++			++count;
++	return count;
+ }
+ 
+ static int gh_ghost_pte_callback(pte_t *ptep, unsigned long addr, void *data)
+@@ -199,8 +202,11 @@
+ 
+ 	mmap_write_lock(mm);
+ 	mutex_lock(&gh_ghost_lock);
+-	if (gh_ghost_mm_has_region_locked(mm) ||
+-	    find_vma_intersection(mm, user_addr, user_addr + length)) {
++	if (gh_ghost_mm_region_count_locked(mm) >= GH_GHOST_MAX_REGIONS_PER_MM) {
++		ret = -ENOSPC;
++		goto fail_unlock;
++	}
++	if (find_vma_intersection(mm, user_addr, user_addr + length)) {
+ 		ret = -EBUSY;
+ 		goto fail_unlock;
+ 	}
+-- 
+2.43.0

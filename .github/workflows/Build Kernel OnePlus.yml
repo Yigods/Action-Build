@@ -83,7 +83,7 @@ on:
           - N/A
       GH_GHOSTHOOK_ROUTER_6118:
         type: boolean
-        description: "GhostHook: pin PKG110 6.1.118 source and add r14 bounded ghost-region + passive undef-trace core (test-only)"
+        description: "GhostHook: pin PKG110 6.1.118 source and add r14c bounded code/data Ghost pair + passive undef-trace core (test-only)"
         required: true
         default: false
       SUSFS_META:
@@ -534,6 +534,9 @@ jobs:
             curl --fail --location --silent --show-error \
               "$GH_PATCH_BASE/0012-ghosthook-add-passive-undef-trace.patch" \
               -o "$GH_PATCH_DIR/0012-ghosthook-add-passive-undef-trace.patch"
+            curl --fail --location --silent --show-error \
+              "$GH_PATCH_BASE/0013-ghosthook-allow-bounded-code-data-pair.patch" \
+              -o "$GH_PATCH_DIR/0013-ghosthook-allow-bounded-code-data-pair.patch"
             curl --fail --location --silent --show-error \
               "$GH_PATCH_BASE/apply_explicit_router.sh" \
               -o "$GH_PATCH_DIR/apply_explicit_router.sh"
