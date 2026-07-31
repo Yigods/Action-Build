@@ -483,10 +483,18 @@ index 74feccd2b874..173e3ffe5cab 100755
  	mmap_write_unlock(mm);
  	vm_unacct_memory(nr_accounted);
 diff --git a/mm/mprotect.c b/mm/mprotect.c
-index 477bf6870103..0c40d80d29b7 100644
+index 477bf68..a03737e 100644
 --- a/mm/mprotect.c
 +++ b/mm/mprotect.c
-@@ -734,6 +734,10 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <linux/pagewalk.h>
++#include <linux/ghosthook.h>
+ #include <linux/hugetlb.h>
+ #include <linux/shm.h>
+ #include <linux/mman.h>
+@@ -734,6 +735,10 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
  
  	if (mmap_write_lock_killable(current->mm))
  		return -EINTR;
