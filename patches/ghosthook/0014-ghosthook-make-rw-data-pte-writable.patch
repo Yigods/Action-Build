@@ -1,0 +1,36 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: no_trace <noreply@example.invalid>
+Date: Sat, 1 Aug 2026 00:00:00 +0800
+Subject: [PATCH] ghosthook: install RW ghost data with DBM write permission
+
+Ghost data has no VMA and therefore has no COW fault path.  The private
+VM_READ|VM_WRITE protection selected PAGE_COPY, which is initially read-only
+on arm64; a Ghost-code STR consequently raised a permission abort.  Select
+the shared writable page protection for this trusted, kernel-owned backing so
+the installed leaf includes PTE_WRITE/DBM.  The external API remains limited
+to a bounded code/data pair and the page is still inaccessible to ordinary
+VMA operations.
+
+---
+ mm/gh_ghost.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/mm/gh_ghost.c b/mm/gh_ghost.c
+index d0b61c5197b1..8d8a28cecab1 100644
+--- a/mm/gh_ghost.c
++++ b/mm/gh_ghost.c
+@@ -216,7 +216,11 @@ int gh_ghost_region_create(struct mm_struct *mm, unsigned long user_addr,
+ 	ret = apply_to_page_range(mm, user_addr, length, gh_ghost_pte_callback, &txn);
+ 	if (ret)
+ 		goto fail_unlock;
+-	txn.prot = vm_get_page_prot(VM_READ | VM_WRITE | VM_MAYREAD | VM_MAYWRITE);
++	/* Ghost backing has no VMA/COW fault path.  PAGE_COPY would install a
++	 * read-only PTE; use the trusted shared-RW leaf so EL0 Ghost code can
++	 * update its paired state through arm64 DBM. */
++	txn.prot = vm_get_page_prot(VM_READ | VM_WRITE | VM_MAYREAD |
++				    VM_MAYWRITE | VM_SHARED);
+ 	txn.op = GH_GHOST_PTE_INSTALL;
+ 	ret = apply_to_page_range(mm, user_addr, length,
+ 					 gh_ghost_pte_callback, &txn);
+-- 
+2.43.0
