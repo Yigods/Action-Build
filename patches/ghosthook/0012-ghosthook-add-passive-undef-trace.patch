@@ -1,0 +1,212 @@
+diff --git a/arch/arm64/kernel/Makefile b/arch/arm64/kernel/Makefile
+index 935012b0a6da..f4b3b70247dd 100644
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -37,6 +37,7 @@ obj-y			:= debug-monitors.o entry.o irq.o fpsimd.o		\
+ 			   smp.o smp_spin_table.o topology.o smccc-call.o	\
+ 			   syscall.o proton-pack.o idreg-override.o idle.o	\
+ 			   patching.o
++obj-y			+= gh_undef_trace.o
+ 
+ targets			+= efi-entry.o
+ 
+diff --git a/arch/arm64/kernel/gh_undef_trace.c b/arch/arm64/kernel/gh_undef_trace.c
+new file mode 100644
+index 000000000000..e4bdd7090447
+--- /dev/null
++++ b/arch/arm64/kernel/gh_undef_trace.c
+@@ -0,0 +1,143 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * GhostHook r14: passive, exact-site EL0 undefined-instruction telemetry.
++ *
++ * This is intentionally an observer, not an undefined-instruction handler:
++ * the caller records a matched EL0 trap and then continues through the stock
++ * SIGILL path unchanged.  One retained struct pid and one exact PC avoid PID
++ * reuse and make the exception-side decision bounded and allocation-free.
++ */
++#include <linux/errno.h>
++#include <linux/ghosthook.h>
++#include <linux/pid.h>
++#include <linux/sched.h>
++#include <linux/spinlock.h>
++
++#include <asm/ptrace.h>
++#include <asm/smp.h>
++
++struct gh_undef_trace_state {
++	struct pid *pid;
++	unsigned long pc;
++	unsigned long hits;
++	bool active;
++	bool valid;
++	struct gh_undef_trace_record record;
++};
++
++static DEFINE_RAW_SPINLOCK(gh_undef_trace_lock);
++static struct gh_undef_trace_state gh_undef_trace;
++
++void gh_undef_trace_record_el0(struct pt_regs *regs, unsigned long esr)
++{
++	unsigned long flags;
++	unsigned int i;
++
++	if (!user_mode(regs))
++		return;
++
++	raw_spin_lock_irqsave(&gh_undef_trace_lock, flags);
++	if (!gh_undef_trace.active || !gh_undef_trace.pid ||
++	    task_pid(current) != gh_undef_trace.pid || regs->pc != gh_undef_trace.pc)
++		goto out;
++
++	gh_undef_trace.hits++;
++	gh_undef_trace.record.sequence = gh_undef_trace.hits;
++	gh_undef_trace.record.tid = task_pid_nr(current);
++	gh_undef_trace.record.cpu = raw_smp_processor_id();
++	gh_undef_trace.record.pc = regs->pc;
++	gh_undef_trace.record.sp = regs->sp;
++	gh_undef_trace.record.pstate = regs->pstate;
++	gh_undef_trace.record.esr = esr;
++	for (i = 0; i < GH_UNDEF_TRACE_GPRS; i++)
++		gh_undef_trace.record.regs[i] = regs->regs[i];
++	gh_undef_trace.valid = true;
++out:
++	raw_spin_unlock_irqrestore(&gh_undef_trace_lock, flags);
++}
++
++int gh_undef_trace_arm(pid_t tid, unsigned long pc)
++{
++	struct pid *pid;
++	unsigned long flags;
++
++	if (tid <= 0 || !pc)
++		return -EINVAL;
++	pid = find_get_pid(tid);
++	if (!pid)
++		return -ESRCH;
++
++	raw_spin_lock_irqsave(&gh_undef_trace_lock, flags);
++	if (gh_undef_trace.active) {
++		raw_spin_unlock_irqrestore(&gh_undef_trace_lock, flags);
++		put_pid(pid);
++		return -EBUSY;
++	}
++	gh_undef_trace.pid = pid;
++	gh_undef_trace.pc = pc;
++	gh_undef_trace.hits = 0;
++	gh_undef_trace.active = true;
++	gh_undef_trace.valid = false;
++	raw_spin_unlock_irqrestore(&gh_undef_trace_lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(gh_undef_trace_arm);
++
++int gh_undef_trace_disarm(pid_t tid)
++{
++	struct pid *pid;
++	unsigned long flags;
++
++	if (tid <= 0)
++		return -EINVAL;
++	raw_spin_lock_irqsave(&gh_undef_trace_lock, flags);
++	if (!gh_undef_trace.active || !gh_undef_trace.pid ||
++	    pid_nr(gh_undef_trace.pid) != tid) {
++		raw_spin_unlock_irqrestore(&gh_undef_trace_lock, flags);
++		return -ENOENT;
++	}
++	pid = gh_undef_trace.pid;
++	gh_undef_trace.pid = NULL;
++	gh_undef_trace.pc = 0;
++	gh_undef_trace.hits = 0;
++	gh_undef_trace.active = false;
++	gh_undef_trace.valid = false;
++	raw_spin_unlock_irqrestore(&gh_undef_trace_lock, flags);
++	put_pid(pid);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(gh_undef_trace_disarm);
++
++int gh_undef_trace_get_stats(struct gh_undef_trace_stats *stats)
++{
++	unsigned long flags;
++
++	if (!stats)
++		return -EINVAL;
++	raw_spin_lock_irqsave(&gh_undef_trace_lock, flags);
++	stats->tid = gh_undef_trace.pid ? pid_nr(gh_undef_trace.pid) : 0;
++	stats->pc = gh_undef_trace.pc;
++	stats->hits = gh_undef_trace.hits;
++	stats->armed = gh_undef_trace.active;
++	stats->valid = gh_undef_trace.valid;
++	raw_spin_unlock_irqrestore(&gh_undef_trace_lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(gh_undef_trace_get_stats);
++
++int gh_undef_trace_read(struct gh_undef_trace_record *record)
++{
++	unsigned long flags;
++
++	if (!record)
++		return -EINVAL;
++	raw_spin_lock_irqsave(&gh_undef_trace_lock, flags);
++	if (!gh_undef_trace.valid) {
++		raw_spin_unlock_irqrestore(&gh_undef_trace_lock, flags);
++		return -ENODATA;
++	}
++	*record = gh_undef_trace.record;
++	raw_spin_unlock_irqrestore(&gh_undef_trace_lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(gh_undef_trace_read);
+diff --git a/arch/arm64/kernel/traps.c b/arch/arm64/kernel/traps.c
+index 23e8822e86b4..b647b4c8752d 100644
+--- a/arch/arm64/kernel/traps.c
++++ b/arch/arm64/kernel/traps.c
+@@ -498,6 +498,7 @@ void do_undefinstr(struct pt_regs *regs, unsigned long esr)
+ 		return;
+ 
+ 	trace_android_rvh_do_undefinstr(regs, esr);
++	gh_undef_trace_record_el0(regs, esr);
+ 	if (!user_mode(regs))
+ 		die("Oops - Undefined instruction", regs, esr);
+ 
+diff --git a/include/linux/ghosthook.h b/include/linux/ghosthook.h
+index 86eb0afc7f17..c32acc3df2a1 100644
+--- a/include/linux/ghosthook.h
++++ b/include/linux/ghosthook.h
+@@ -116,4 +116,34 @@ void gh_ss_trace_task_exit(struct task_struct *task);
+ /* Built-in init hook invoked after direct HWBP router registration. */
+ int gh_ss_trace_register_router(void);
+ 
++
++/*
++ * Passive EL0 undefined-instruction capture, one retained TID/PC session.
++ * do_undefinstr() records an exact match then preserves normal SIGILL flow.
++ */
++#define GH_UNDEF_TRACE_GPRS 31
++struct gh_undef_trace_record {
++	unsigned long sequence;
++	pid_t tid;
++	u32 cpu;
++	unsigned long pc;
++	unsigned long sp;
++	unsigned long pstate;
++	unsigned long esr;
++	unsigned long regs[GH_UNDEF_TRACE_GPRS];
++};
++struct gh_undef_trace_stats {
++	pid_t tid;
++	unsigned long pc;
++	unsigned long hits;
++	int armed;
++	int valid;
++};
++int gh_undef_trace_arm(pid_t tid, unsigned long pc);
++int gh_undef_trace_disarm(pid_t tid);
++int gh_undef_trace_get_stats(struct gh_undef_trace_stats *stats);
++int gh_undef_trace_read(struct gh_undef_trace_record *record);
++/* Exception-context entry: no allocation, no blocking, no signal suppression. */
++void gh_undef_trace_record_el0(struct pt_regs *regs, unsigned long esr);
++
+ #endif /* _LINUX_GHOSTHOOK_H */

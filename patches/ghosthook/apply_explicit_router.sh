@@ -30,7 +30,8 @@ for patch in \
     "$self_dir/0008-ghosthook-add-bounded-ss-trace-core.patch" \
     "$self_dir/0009-ghosthook-ss-trace-target-task-work.patch" \
     "$self_dir/0010-ghosthook-register-ss-core-from-hwbp-init.patch" \
-    "$self_dir/0011-ghosthook-add-bounded-ghost-region.patch"; do
+    "$self_dir/0011-ghosthook-add-bounded-ghost-region.patch" \
+    "$self_dir/0012-ghosthook-add-passive-undef-trace.patch"; do
     [ -f "$patch" ] || { echo "missing patch: $patch" >&2; exit 5; }
     git -C "$common" apply --check "$patch"
     git -C "$common" apply "$patch"
@@ -54,5 +55,8 @@ grep -q 'gh_ss_trace_register_router' "$common/arch/arm64/kernel/hw_breakpoint.c
 grep -q 'gh_ghost_region_create' "$common/mm/gh_ghost.c"
 grep -q 'gh_ghost_region_overlaps' "$common/mm/mmap.c"
 grep -q 'gh_ghost_region_mm_exit' "$common/mm/mmap.c"
+grep -q 'gh_undef_trace_record_el0' "$common/arch/arm64/kernel/traps.c"
+grep -q 'gh_undef_trace_arm' "$common/arch/arm64/kernel/gh_undef_trace.c"
+grep -q 'gh_undef_trace_read' "$common/arch/arm64/kernel/gh_undef_trace.c"
 test -f "$common/include/linux/ghosthook.h"
 printf 'GhostHook explicit router stack applied to %s\n' "$actual"

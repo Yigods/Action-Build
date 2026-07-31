@@ -83,7 +83,7 @@ on:
           - N/A
       GH_GHOSTHOOK_ROUTER_6118:
         type: boolean
-        description: "GhostHook: pin PKG110 6.1.118 source and add r13 bounded ghost-region core (test-only)"
+        description: "GhostHook: pin PKG110 6.1.118 source and add r14 bounded ghost-region + passive undef-trace core (test-only)"
         required: true
         default: false
       SUSFS_META:
@@ -492,8 +492,9 @@ jobs:
             pin_repo "$PWD/kernel_platform/msm-kernel" 9c349a72a250c9bfdc3360cc2a549c2c2d133fc6 msm
             # workflow_dispatch can execute a selected workflow file while
             # actions/checkout still supplies the repository default tree.
-            # Fetch the reviewed patch stack from its immutable content commit.
-            GH_PATCH_REF=0ccf4dd265addb154a71209680d9f86b4afe9408
+            # Checkout is pinned to github.ref above; fetch this exact run's
+            # patch stack rather than an older hard-coded content commit.
+            GH_PATCH_REF="${{ github.sha }}"
             GH_PATCH_BASE="https://raw.githubusercontent.com/Yigods/Action-Build/${GH_PATCH_REF}/patches/ghosthook"
             GH_PATCH_DIR="$PWD/.ghosthook-router-patch"
             mkdir -p "$GH_PATCH_DIR"
@@ -530,6 +531,9 @@ jobs:
             curl --fail --location --silent --show-error \
               "$GH_PATCH_BASE/0011-ghosthook-add-bounded-ghost-region.patch" \
               -o "$GH_PATCH_DIR/0011-ghosthook-add-bounded-ghost-region.patch"
+            curl --fail --location --silent --show-error \
+              "$GH_PATCH_BASE/0012-ghosthook-add-passive-undef-trace.patch" \
+              -o "$GH_PATCH_DIR/0012-ghosthook-add-passive-undef-trace.patch"
             curl --fail --location --silent --show-error \
               "$GH_PATCH_BASE/apply_explicit_router.sh" \
               -o "$GH_PATCH_DIR/apply_explicit_router.sh"
