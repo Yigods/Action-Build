@@ -27,7 +27,8 @@ for patch in \
     "$self_dir/0005-ghosthook-add-direct-hwbp-ss-conflict-guard.patch" \
     "$self_dir/0006-ghosthook-add-direct-hwbp-task-exit-reclaim.patch" \
     "$self_dir/0007-ghosthook-add-debug-core-chain.patch" \
-    "$self_dir/0008-ghosthook-add-bounded-ss-trace-core.patch"; do
+    "$self_dir/0008-ghosthook-add-bounded-ss-trace-core.patch" \
+    "$self_dir/0009-ghosthook-ss-trace-target-task-work.patch"; do
     [ -f "$patch" ] || { echo "missing patch: $patch" >&2; exit 5; }
     git -C "$common" apply --check "$patch"
     git -C "$common" apply "$patch"
@@ -45,5 +46,7 @@ grep -q 'ss_conflicted' "$common/arch/arm64/kernel/hw_breakpoint.c"
 grep -q 'gh_hwbp_direct_task_exit' "$common/kernel/exit.c"
 grep -q 'GH_DEBUG_ROUTER_CORE_MAX 2' "$common/arch/arm64/mm/fault.c"
 grep -q 'gh_ss_trace_arm' "$common/arch/arm64/kernel/gh_ss_trace.c"
+grep -q 'gh_ss_trace_arm_work' "$common/arch/arm64/kernel/gh_ss_trace.c"
+grep -q 'task_work_add' "$common/arch/arm64/kernel/gh_ss_trace.c"
 test -f "$common/include/linux/ghosthook.h"
 printf 'GhostHook explicit router stack applied to %s\n' "$actual"

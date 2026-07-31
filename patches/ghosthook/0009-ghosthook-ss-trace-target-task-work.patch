@@ -1,0 +1,201 @@
+From 27a9c1f0ghostr11 Mon Sep 17 00:00:00 2001
+From: no_trace <no_trace@local>
+Date: Fri, 31 Jul 2026 08:45:00 +0800
+Subject: [PATCH] arm64: run bounded SS transitions in the target task
+
+The initial bounded SS core used an IPI callback after affinity pinning. That
+callback could run while another task was current on the selected CPU and its
+fallback path called user_disable_single_step(current), altering an unrelated
+task. It also directly updated a live remote task's user debug state.
+
+Queue TWA_RESUME task_work instead.  Arm and disarm transitions now execute in
+the selected target task at its EL0 return (or exit); control paths only alter
+session ownership and affinity.  Keep the existing bounded ring, automatic
+limit disarm and do_exit cleanup, and prevent a new session while an old
+transition work item remains pending.
+---
+diff --git a/arch/arm64/kernel/gh_ss_trace.c b/arch/arm64/kernel/gh_ss_trace.c
+index 4b7d1f7..39f7ce9 100644
+--- a/arch/arm64/kernel/gh_ss_trace.c
++++ b/arch/arm64/kernel/gh_ss_trace.c
+@@ -13,9 +13,9 @@
+ #include <linux/init.h>
+ #include <linux/pid.h>
+ #include <linux/ptrace.h>
+-#include <linux/smp.h>
+-#include <linux/spinlock.h>
+ #include <linux/sched.h>
++#include <linux/spinlock.h>
++#include <linux/task_work.h>
+ 
+ #include <asm/current.h>
+ #include <asm/debug-monitors.h>
+@@ -36,9 +36,13 @@ struct gh_ss_trace_state {
+ 	unsigned long limit;
+ 	unsigned long hits;
+ 	int cpu;
++	struct callback_head arm_work;
++	struct callback_head disarm_work;
+ 	bool active;
+ 	bool ss_owned;
+ 	bool affinity_saved;
++	bool arm_work_pending;
++	bool disarm_work_pending;
+ };
+ 
+ static DEFINE_RAW_SPINLOCK(gh_ss_trace_lock);
+@@ -83,21 +87,38 @@ static void gh_ss_trace_record_locked(struct pt_regs *regs)
+ 		record->regs[i] = regs->regs[i];
+ }
+ 
+-static void gh_ss_trace_sync_current(void *unused)
++/*
++ * task_work runs in the target task just before its EL0 return (or at exit).
++ * It is the only non-exception path that touches that task's SS state; this
++ * avoids applying user_disable_single_step() to an unrelated current task.
++ */
++static void gh_ss_trace_arm_work(struct callback_head *work)
+ {
+ 	unsigned long flags;
+ 	bool enable = false;
+ 
+-	(void)unused;
++	(void)work;
+ 	raw_spin_lock_irqsave(&gh_ss_trace_lock, flags);
+-	if (gh_ss_trace.active && gh_ss_trace.ss_owned &&
+-	    gh_ss_trace_task_matches(current))
++	gh_ss_trace.arm_work_pending = false;
++	if (gh_ss_trace.active && !gh_ss_trace.ss_owned &&
++	    gh_ss_trace_task_matches(current) && !(current->flags & PF_EXITING)) {
++		gh_ss_trace.ss_owned = true;
+ 		enable = true;
++	}
+ 	raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
+ 	if (enable)
+ 		user_enable_single_step(current);
+-	else
+-		user_disable_single_step(current);
++}
++
++static void gh_ss_trace_disarm_work(struct callback_head *work)
++{
++	unsigned long flags;
++
++	(void)work;
++	user_disable_single_step(current);
++	raw_spin_lock_irqsave(&gh_ss_trace_lock, flags);
++	gh_ss_trace.disarm_work_pending = false;
++	raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
+ }
+ 
+ static bool gh_ss_trace_debug_event(unsigned long addr_if_watchpoint,
+@@ -166,7 +187,7 @@ int gh_ss_trace_arm(pid_t tid, unsigned long limit)
+ 		put_pid(pid);
+ 		return -EAGAIN;
+ 	}
+-	/* Control path only: retain the original mask and pin before SS is set. */
++	/* Retain the original mask, then force one execution CPU for this session. */
+ 	cpumask_copy(&saved_mask, task->cpus_ptr);
+ 	ret = set_cpus_allowed_ptr(task, cpumask_of(cpu));
+ 	if (ret) {
+@@ -175,7 +196,8 @@ int gh_ss_trace_arm(pid_t tid, unsigned long limit)
+ 		return ret;
+ 	}
+ 	raw_spin_lock_irqsave(&gh_ss_trace_lock, flags);
+-	if (gh_ss_trace.pid) {
++	if (gh_ss_trace.pid || gh_ss_trace.arm_work_pending ||
++	    gh_ss_trace.disarm_work_pending) {
+ 		raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
+ 		(void)set_cpus_allowed_ptr(task, &saved_mask);
+ 		put_task_struct(task);
+@@ -188,13 +210,29 @@ int gh_ss_trace_arm(pid_t tid, unsigned long limit)
+ 	gh_ss_trace.hits = 0;
+ 	gh_ss_trace.cpu = cpu;
+ 	gh_ss_trace.active = true;
+-	gh_ss_trace.ss_owned = true;
++	gh_ss_trace.ss_owned = false;
+ 	gh_ss_trace.affinity_saved = true;
++	init_task_work(&gh_ss_trace.arm_work, gh_ss_trace_arm_work);
++	gh_ss_trace.arm_work_pending = true;
+ 	gh_ss_trace_reset_locked();
+ 	raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
+-	user_enable_single_step(task);
+-	/* Apply SS immediately if the pinned target happens to be running. */
+-	smp_call_function_single(cpu, gh_ss_trace_sync_current, NULL, 1);
++	/* Never mutate another running task's pt_regs from this control context. */
++	ret = task_work_add(task, &gh_ss_trace.arm_work, TWA_RESUME);
++	if (ret) {
++		raw_spin_lock_irqsave(&gh_ss_trace_lock, flags);
++		if (gh_ss_trace.pid == pid) {
++			gh_ss_trace.pid = NULL;
++			gh_ss_trace.active = false;
++			gh_ss_trace.ss_owned = false;
++			gh_ss_trace.affinity_saved = false;
++			gh_ss_trace.arm_work_pending = false;
++		}
++		raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
++		(void)set_cpus_allowed_ptr(task, &saved_mask);
++		put_task_struct(task);
++		put_pid(pid);
++		return ret;
++	}
+ 	put_task_struct(task);
+ 	return 0;
+ }
+@@ -206,8 +244,8 @@ int gh_ss_trace_stop(pid_t tid)
+ 	struct pid *owned;
+ 	cpumask_t saved_mask;
+ 	unsigned long flags;
+-	int cpu;
+ 	bool restore;
++	bool queue_disarm;
+ 
+ 	if (tid <= 0)
+ 		return -EINVAL;
+@@ -217,22 +255,34 @@ int gh_ss_trace_stop(pid_t tid)
+ 		return -ENOENT;
+ 	}
+ 	owned = gh_ss_trace.pid;
+-	cpu = gh_ss_trace.cpu;
+ 	restore = gh_ss_trace.affinity_saved;
++	queue_disarm = gh_ss_trace.ss_owned;
+ 	cpumask_copy(&saved_mask, &gh_ss_trace.saved_mask);
+ 	gh_ss_trace.active = false;
+ 	gh_ss_trace.ss_owned = false;
+ 	gh_ss_trace.pid = NULL;
+ 	gh_ss_trace.affinity_saved = false;
++	if (queue_disarm) {
++		init_task_work(&gh_ss_trace.disarm_work, gh_ss_trace_disarm_work);
++		gh_ss_trace.disarm_work_pending = true;
++	}
+ 	raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
+ 	task = get_pid_task(owned, PIDTYPE_PID);
+ 	if (task) {
+-		user_disable_single_step(task);
+-		if (cpu_online(cpu))
+-			smp_call_function_single(cpu, gh_ss_trace_sync_current, NULL, 1);
++		if (queue_disarm) {
++			if (task_work_add(task, &gh_ss_trace.disarm_work, TWA_RESUME)) {
++				raw_spin_lock_irqsave(&gh_ss_trace_lock, flags);
++				gh_ss_trace.disarm_work_pending = false;
++				raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
++			}
++		}
+ 		if (restore)
+ 			(void)set_cpus_allowed_ptr(task, &saved_mask);
+ 		put_task_struct(task);
++	} else if (queue_disarm) {
++		raw_spin_lock_irqsave(&gh_ss_trace_lock, flags);
++		gh_ss_trace.disarm_work_pending = false;
++		raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
+ 	}
+ 	put_pid(owned);
+ 	return 0;
+@@ -301,6 +351,7 @@ void gh_ss_trace_task_exit(struct task_struct *task)
+ 		return;
+ 	raw_spin_lock_irqsave(&gh_ss_trace_lock, flags);
+ 	if (gh_ss_trace.pid && gh_ss_trace_task_matches(task)) {
++		/* do_exit() runs in the target context, so this is always local. */
+ 		user_disable_single_step(task);
+ 		owned = gh_ss_trace.pid;
+ 		gh_ss_trace.pid = NULL;
