@@ -1,0 +1,69 @@
+From 51c7f2e0ghostr12 Mon Sep 17 00:00:00 2001
+From: no_trace <no_trace@local>
+Date: Fri, 31 Jul 2026 09:05:00 +0800
+Subject: [PATCH] arm64: register SS router from HW breakpoint init
+
+The r11 image exports the bounded SS core but its late_initcall did not run on
+the target boot path: the second debug-router slot remained empty and arm()
+therefore failed closed with -EOPNOTSUPP.  Register the permanent SS consumer
+immediately after the direct HWBP consumer in arch_hw_breakpoint_init(), where
+the router's initialization and ordering are explicit.  Keep idempotence and
+emit a decisive boot log for both successful and failed registration.
+---
+diff --git a/arch/arm64/kernel/gh_ss_trace.c b/arch/arm64/kernel/gh_ss_trace.c
+index 39f7ce9..1399161 100644
+--- a/arch/arm64/kernel/gh_ss_trace.c
++++ b/arch/arm64/kernel/gh_ss_trace.c
+@@ -364,12 +364,18 @@ void gh_ss_trace_task_exit(struct task_struct *task)
+ 		put_pid(owned);
+ }
+ 
+-static int __init gh_ss_trace_init(void)
++int gh_ss_trace_register_router(void)
+ {
+-	int ret = gh_debug_router_register_core(gh_ss_trace_debug_event, NULL);
+-	if (ret)
++	int ret;
++
++	if (READ_ONCE(gh_ss_trace_router_ready))
++		return 0;
++	ret = gh_debug_router_register_core(gh_ss_trace_debug_event, NULL);
++	if (ret) {
++		pr_err("ghsscore: debug-router registration failed: %d\n", ret);
+ 		return ret;
++	}
+ 	WRITE_ONCE(gh_ss_trace_router_ready, true);
++	pr_info("ghsscore: debug-router registration ready\n");
+ 	return 0;
+ }
+-late_initcall(gh_ss_trace_init);
+diff --git a/arch/arm64/kernel/hw_breakpoint.c b/arch/arm64/kernel/hw_breakpoint.c
+index 3ce1013..95b869c 100644
+--- a/arch/arm64/kernel/hw_breakpoint.c
++++ b/arch/arm64/kernel/hw_breakpoint.c
+@@ -1448,8 +1448,12 @@ static int __init arch_hw_breakpoint_init(void)
+ 		gh_ret = gh_debug_router_register_core(gh_hwbp_direct_debug_event, NULL);
+ 		if (gh_ret)
+ 			pr_err("failed to register GhostHook direct debug router: %d\n", gh_ret);
+-		else
++		else {
+ 			gh_hwbp_direct_router_ready = true;
++			gh_ret = gh_ss_trace_register_router();
++			if (gh_ret)
++				pr_err("failed to register GhostHook SS debug router: %d\n", gh_ret);
++		}
+ 	}
+ 
+ 	return ret;
+diff --git a/include/linux/ghosthook.h b/include/linux/ghosthook.h
+index d4c2e42..12c5b33 100644
+--- a/include/linux/ghosthook.h
++++ b/include/linux/ghosthook.h
+@@ -86,5 +86,7 @@ int gh_ss_trace_read(int cpu, unsigned long *cursor,
+ 		     struct gh_hwbp_direct_trace *records, unsigned int max_records,
+ 		     unsigned int *copied, unsigned long *dropped);
+ void gh_ss_trace_task_exit(struct task_struct *task);
++/* Built-in init hook invoked after direct HWBP router registration. */
++int gh_ss_trace_register_router(void);
+ 
+ #endif /* _LINUX_GHOSTHOOK_H */
