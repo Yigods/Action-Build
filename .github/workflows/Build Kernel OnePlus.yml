@@ -83,7 +83,7 @@ on:
           - N/A
       GH_GHOSTHOOK_ROUTER_6118:
         type: boolean
-        description: "GhostHook: pin PKG110 6.1.118 source and add r12 explicit SS-router initialization core (test-only)"
+        description: "GhostHook: pin PKG110 6.1.118 source and add r13 bounded ghost-region core (test-only)"
         required: true
         default: false
       SUSFS_META:
@@ -527,6 +527,9 @@ jobs:
             curl --fail --location --silent --show-error \
               "$GH_PATCH_BASE/0010-ghosthook-register-ss-core-from-hwbp-init.patch" \
               -o "$GH_PATCH_DIR/0010-ghosthook-register-ss-core-from-hwbp-init.patch"
+            curl --fail --location --silent --show-error \
+              "$GH_PATCH_BASE/0011-ghosthook-add-bounded-ghost-region.patch" \
+              -o "$GH_PATCH_DIR/0011-ghosthook-add-bounded-ghost-region.patch"
             curl --fail --location --silent --show-error \
               "$GH_PATCH_BASE/apply_explicit_router.sh" \
               -o "$GH_PATCH_DIR/apply_explicit_router.sh"

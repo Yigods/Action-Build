@@ -1,0 +1,540 @@
+diff --git a/include/linux/ghosthook.h b/include/linux/ghosthook.h
+index 12c5b33a9447..86eb0afc7f17 100644
+--- a/include/linux/ghosthook.h
++++ b/include/linux/ghosthook.h
+@@ -6,6 +6,33 @@
+ 
+ struct pt_regs;
+ struct task_struct;
++struct mm_struct;
++
++/* r13 VMA-less region API. A region is one bounded, owner-mm allocation that
++ * transitions RW -> RX exactly once; callers must quiesce user execution
++ * before destroy. */
++#define GH_GHOST_F_READ  (1UL << 0)
++#define GH_GHOST_F_WRITE (1UL << 1)
++#define GH_GHOST_STATE_RW 1U
++#define GH_GHOST_STATE_RX 2U
++struct gh_ghost_region_info {
++	unsigned long start;
++	unsigned long length;
++	u64 handle;
++	u32 state;
++};
++int gh_ghost_region_create(struct mm_struct *mm, unsigned long user_addr,
++			   unsigned long length, unsigned long flags, u64 *handle_out);
++int gh_ghost_region_write(struct mm_struct *mm, u64 handle,
++			  unsigned long offset, const void *src, size_t len);
++int gh_ghost_region_seal_rx(struct mm_struct *mm, u64 handle);
++int gh_ghost_region_destroy(struct mm_struct *mm, u64 handle);
++int gh_ghost_region_query(struct mm_struct *mm, unsigned long addr,
++			  struct gh_ghost_region_info *out);
++/* VM internals call these while mmap_write_lock(mm) is held. */
++bool gh_ghost_region_overlaps(struct mm_struct *mm, unsigned long start,
++				      unsigned long length);
++void gh_ghost_region_mm_exit(struct mm_struct *mm);
+ 
+ /*
+  * Return true only when the callback has completely consumed the exception
+diff --git a/mm/Makefile b/mm/Makefile
+index 8f4e02689db0..3d19af7d805c 100755
+--- a/mm/Makefile
++++ b/mm/Makefile
+@@ -165,3 +165,6 @@ obj-$(CONFIG_OPLUS_FEATURE_DYNAMIC_READAHEAD) += oplus_bsp_dynamic_readahead.o
+ oplus_bsp_dynamic_readahead-y := dynamic_readahead.o
+ #endif
+ obj-$(CONFIG_BLOCKIO_UX_OPT) += fileprotect.o
++
++# GhostHook r13 bounded VMA-less region manager
++obj-y += gh_ghost.o
+diff --git a/mm/gh_ghost.c b/mm/gh_ghost.c
+new file mode 100644
+index 000000000000..0657f344d62f
+--- /dev/null
++++ b/mm/gh_ghost.c
+@@ -0,0 +1,388 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * GhostHook r13: narrowly scoped VMA-less RX-region backing.
++ *
++ * This is deliberately not a generic remapper.  A region belongs to one mm,
++ * starts RW, is filled by a trusted in-kernel caller, and may be sealed once
++ * to RX.  The region registry is consulted by mmap/munmap/mprotect/mremap
++ * gates so ordinary VM operations cannot silently overlap the unmanaged leaf
++ * PTEs.  The first version permits exactly one bounded region per mm.
++ */
++#include <linux/errno.h>
++#include <linux/ghosthook.h>
++#include <linux/highmem.h>
++#include <linux/list.h>
++#include <linux/mm.h>
++#include <linux/mutex.h>
++#include <linux/slab.h>
++#include <linux/string.h>
++#include <asm/cacheflush.h>
++#include <asm/tlbflush.h>
++
++#define GH_GHOST_MAX_PAGES	16UL
++
++struct gh_ghost_region {
++	struct list_head node;
++	struct mm_struct *mm;
++	struct page **pages;
++	unsigned long start;
++	unsigned long length;
++	unsigned long nr_pages;
++	u64 handle;
++	u32 state;
++};
++
++enum gh_ghost_pte_op {
++	GH_GHOST_PTE_PROBE = 0,
++	GH_GHOST_PTE_INSTALL,
++	GH_GHOST_PTE_CLEAR,
++};
++
++struct gh_ghost_pte_txn {
++	struct gh_ghost_region *region;
++	pgprot_t prot;
++	enum gh_ghost_pte_op op;
++};
++
++static LIST_HEAD(gh_ghost_regions);
++static DEFINE_MUTEX(gh_ghost_lock);
++static atomic64_t gh_ghost_next_handle = ATOMIC64_INIT(0);
++
++static bool gh_ghost_range_valid(unsigned long start, unsigned long length)
++{
++	return start && length && !(start & ~PAGE_MASK) &&
++		!(length & ~PAGE_MASK) && start <= TASK_SIZE - length;
++}
++
++static bool gh_ghost_intersects(unsigned long start, unsigned long length,
++				unsigned long other_start,
++				unsigned long other_length)
++{
++	unsigned long end = start + length;
++	unsigned long other_end = other_start + other_length;
++
++	return start < other_end && other_start < end;
++}
++
++static struct gh_ghost_region *gh_ghost_find_handle_locked(struct mm_struct *mm,
++							    u64 handle)
++{
++	struct gh_ghost_region *region;
++
++	list_for_each_entry(region, &gh_ghost_regions, node)
++		if (region->mm == mm && region->handle == handle)
++			return region;
++	return NULL;
++}
++
++static bool gh_ghost_mm_has_region_locked(struct mm_struct *mm)
++{
++	struct gh_ghost_region *region;
++
++	list_for_each_entry(region, &gh_ghost_regions, node)
++		if (region->mm == mm)
++			return true;
++	return false;
++}
++
++static int gh_ghost_pte_callback(pte_t *ptep, unsigned long addr, void *data)
++{
++	struct gh_ghost_pte_txn *txn = data;
++	struct gh_ghost_region *region = txn->region;
++	unsigned long index = (addr - region->start) >> PAGE_SHIFT;
++	pte_t old;
++
++	if (addr < region->start || index >= region->nr_pages)
++		return -EINVAL;
++	switch (txn->op) {
++	case GH_GHOST_PTE_PROBE:
++		return pte_none(READ_ONCE(*ptep)) ? 0 : -EEXIST;
++	case GH_GHOST_PTE_INSTALL:
++		if (!pte_none(READ_ONCE(*ptep)))
++			return -EEXIST;
++		set_pte_at(region->mm, addr, ptep,
++			   mk_pte(region->pages[index], txn->prot));
++		return 0;
++	case GH_GHOST_PTE_CLEAR:
++		old = ptep_get_and_clear(region->mm, addr, ptep);
++		if (pte_none(old) || pte_pfn(old) != page_to_pfn(region->pages[index]))
++			return -EUCLEAN;
++		return 0;
++	}
++	return -EINVAL;
++}
++
++static void gh_ghost_release_region(struct gh_ghost_region *region)
++{
++	unsigned long i;
++
++	for (i = 0; i < region->nr_pages; ++i)
++		if (region->pages[i])
++			__free_page(region->pages[i]);
++	kfree(region->pages);
++	mmdrop(region->mm);
++	kfree(region);
++}
++
++static int gh_ghost_clear_locked(struct gh_ghost_region *region)
++{
++	struct gh_ghost_pte_txn txn = {
++		.region = region,
++		.op = GH_GHOST_PTE_CLEAR,
++	};
++	int ret;
++
++	ret = apply_to_existing_page_range(region->mm, region->start,
++					   region->length, gh_ghost_pte_callback, &txn);
++	/* A completed PTE clear must be visible to every CPU before freeing pages. */
++	flush_tlb_mm(region->mm);
++	return ret;
++}
++
++bool gh_ghost_region_overlaps(struct mm_struct *mm, unsigned long start,
++				      unsigned long length)
++{
++	struct gh_ghost_region *region;
++	bool overlap = true;
++
++	if (!gh_ghost_range_valid(start, length))
++		return true;
++	mutex_lock(&gh_ghost_lock);
++	list_for_each_entry(region, &gh_ghost_regions, node) {
++		if (region->mm == mm && gh_ghost_intersects(start, length,
++							   region->start, region->length)) {
++			overlap = true;
++			goto out;
++		}
++	}
++	overlap = false;
++out:
++	mutex_unlock(&gh_ghost_lock);
++	return overlap;
++}
++
++int gh_ghost_region_create(struct mm_struct *mm, unsigned long user_addr,
++			   unsigned long length, unsigned long flags, u64 *handle_out)
++{
++	struct gh_ghost_region *region;
++	struct gh_ghost_pte_txn txn;
++	unsigned long i;
++	int ret = 0;
++
++	if (!mm || !handle_out || !gh_ghost_range_valid(user_addr, length) ||
++	    flags != (GH_GHOST_F_READ | GH_GHOST_F_WRITE) ||
++	    length >> PAGE_SHIFT > GH_GHOST_MAX_PAGES)
++		return -EINVAL;
++	region = kzalloc(sizeof(*region), GFP_KERNEL);
++	if (!region)
++		return -ENOMEM;
++	region->nr_pages = length >> PAGE_SHIFT;
++	region->pages = kcalloc(region->nr_pages, sizeof(*region->pages), GFP_KERNEL);
++	if (!region->pages) {
++		kfree(region);
++		return -ENOMEM;
++	}
++	region->mm = mm;
++	/* Keep mm_struct storage alive even after its last users exits. */
++	mmgrab(mm);
++	for (i = 0; i < region->nr_pages; ++i) {
++		region->pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
++		if (!region->pages[i]) {
++			ret = -ENOMEM;
++			goto fail_free;
++		}
++	}
++	region->start = user_addr;
++	region->length = length;
++	region->handle = atomic64_inc_return(&gh_ghost_next_handle);
++	region->state = GH_GHOST_STATE_RW;
++
++	mmap_write_lock(mm);
++	mutex_lock(&gh_ghost_lock);
++	if (gh_ghost_mm_has_region_locked(mm) ||
++	    find_vma_intersection(mm, user_addr, user_addr + length)) {
++		ret = -EBUSY;
++		goto fail_unlock;
++	}
++	/* Probe before install so an unexpected stale PTE cannot be overwritten. */
++	txn.region = region;
++	txn.op = GH_GHOST_PTE_PROBE;
++	ret = apply_to_page_range(mm, user_addr, length, gh_ghost_pte_callback, &txn);
++	if (ret)
++		goto fail_unlock;
++	txn.prot = vm_get_page_prot(VM_READ | VM_WRITE | VM_MAYREAD | VM_MAYWRITE);
++	txn.op = GH_GHOST_PTE_INSTALL;
++	ret = apply_to_page_range(mm, user_addr, length,
++					 gh_ghost_pte_callback, &txn);
++	if (ret) {
++		(void)gh_ghost_clear_locked(region);
++		goto fail_unlock;
++	}
++	flush_tlb_mm(mm);
++	list_add(&region->node, &gh_ghost_regions);
++	*handle_out = region->handle;
++	mutex_unlock(&gh_ghost_lock);
++	mmap_write_unlock(mm);
++	return 0;
++
++fail_unlock:
++	mutex_unlock(&gh_ghost_lock);
++	mmap_write_unlock(mm);
++fail_free:
++	gh_ghost_release_region(region);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(gh_ghost_region_create);
++
++int gh_ghost_region_write(struct mm_struct *mm, u64 handle,
++			  unsigned long offset, const void *src, size_t len)
++{
++	struct gh_ghost_region *region;
++	const u8 *input = src;
++	unsigned long page_offset;
++	unsigned long chunk;
++	int ret = 0;
++
++	if (!mm || !src || offset > ULONG_MAX - len)
++		return -EINVAL;
++	mutex_lock(&gh_ghost_lock);
++	region = gh_ghost_find_handle_locked(mm, handle);
++	if (!region || region->state != GH_GHOST_STATE_RW ||
++	    offset + len > region->length) {
++		ret = -EINVAL;
++		goto out;
++	}
++	while (len) {
++		unsigned long page = offset >> PAGE_SHIFT;
++
++		page_offset = offset & ~PAGE_MASK;
++		chunk = min_t(unsigned long, len, PAGE_SIZE - page_offset);
++		memcpy((u8 *)page_address(region->pages[page]) + page_offset, input,
++		       chunk);
++		offset += chunk;
++		input += chunk;
++		len -= chunk;
++	}
++out:
++	mutex_unlock(&gh_ghost_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(gh_ghost_region_write);
++
++int gh_ghost_region_seal_rx(struct mm_struct *mm, u64 handle)
++{
++	struct gh_ghost_region *region;
++	struct gh_ghost_pte_txn txn;
++	unsigned long i;
++	int ret = 0;
++
++	if (!mm)
++		return -EINVAL;
++	mmap_write_lock(mm);
++	mutex_lock(&gh_ghost_lock);
++	region = gh_ghost_find_handle_locked(mm, handle);
++	if (!region || region->state != GH_GHOST_STATE_RW) {
++		ret = -EINVAL;
++		goto out;
++	}
++	for (i = 0; i < region->nr_pages; ++i) {
++		unsigned long start = (unsigned long)page_address(region->pages[i]);
++
++		flush_dcache_page(region->pages[i]);
++		flush_icache_range(start, start + PAGE_SIZE);
++	}
++	/* Replacing an already-present PTE needs an explicit clear/install step. */
++	ret = gh_ghost_clear_locked(region);
++	if (ret)
++		goto out;
++	txn.region = region;
++	txn.prot = vm_get_page_prot(VM_READ | VM_EXEC | VM_MAYREAD | VM_MAYEXEC);
++	txn.op = GH_GHOST_PTE_INSTALL;
++	ret = apply_to_page_range(mm, region->start, region->length,
++					 gh_ghost_pte_callback, &txn);
++	if (ret) {
++		/* Fail closed: no leaf PTE is preferable to a partly sealed region. */
++		(void)gh_ghost_clear_locked(region);
++		goto out;
++	}
++	flush_tlb_mm(mm);
++	region->state = GH_GHOST_STATE_RX;
++out:
++	mutex_unlock(&gh_ghost_lock);
++	mmap_write_unlock(mm);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(gh_ghost_region_seal_rx);
++
++int gh_ghost_region_destroy(struct mm_struct *mm, u64 handle)
++{
++	struct gh_ghost_region *region;
++	int ret = 0;
++
++	if (!mm)
++		return -EINVAL;
++	mmap_write_lock(mm);
++	mutex_lock(&gh_ghost_lock);
++	region = gh_ghost_find_handle_locked(mm, handle);
++	if (!region) {
++		ret = -ENOENT;
++		goto out;
++	}
++	ret = gh_ghost_clear_locked(region);
++	if (ret)
++		goto out;
++	list_del(&region->node);
++	mutex_unlock(&gh_ghost_lock);
++	mmap_write_unlock(mm);
++	gh_ghost_release_region(region);
++	return 0;
++out:
++	mutex_unlock(&gh_ghost_lock);
++	mmap_write_unlock(mm);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(gh_ghost_region_destroy);
++
++int gh_ghost_region_query(struct mm_struct *mm, unsigned long addr,
++			  struct gh_ghost_region_info *out)
++{
++	struct gh_ghost_region *region;
++	int ret = -ENOENT;
++
++	if (!mm || !out)
++		return -EINVAL;
++	mutex_lock(&gh_ghost_lock);
++	list_for_each_entry(region, &gh_ghost_regions, node) {
++		if (region->mm == mm && addr >= region->start &&
++		    addr < region->start + region->length) {
++			out->start = region->start;
++			out->length = region->length;
++			out->handle = region->handle;
++			out->state = region->state;
++			ret = 0;
++			break;
++		}
++	}
++	mutex_unlock(&gh_ghost_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(gh_ghost_region_query);
++
++void gh_ghost_region_mm_exit(struct mm_struct *mm)
++{
++	struct gh_ghost_region *region, *tmp;
++
++	mutex_lock(&gh_ghost_lock);
++	list_for_each_entry_safe(region, tmp, &gh_ghost_regions, node) {
++		if (region->mm != mm)
++			continue;
++		/* exit_mmap() holds mmap_write_lock and no user can execute this mm. */
++		if (gh_ghost_clear_locked(region))
++			continue;
++		list_del(&region->node);
++		mutex_unlock(&gh_ghost_lock);
++		gh_ghost_release_region(region);
++		mutex_lock(&gh_ghost_lock);
++	}
++	mutex_unlock(&gh_ghost_lock);
++}
+diff --git a/mm/mmap.c b/mm/mmap.c
+index 74feccd2b874..173e3ffe5cab 100755
+--- a/mm/mmap.c
++++ b/mm/mmap.c
+@@ -13,6 +13,7 @@
+ #include <linux/slab.h>
+ #include <linux/backing-dev.h>
+ #include <linux/mm.h>
++#include <linux/ghosthook.h>
+ #include <linux/mm_inline.h>
+ #include <linux/shm.h>
+ #include <linux/mman.h>
+@@ -1360,6 +1361,10 @@ unsigned long do_mmap(struct file *file, unsigned long addr,
+ 	addr = get_unmapped_area(file, addr, len, pgoff, flags);
+ 	if (IS_ERR_VALUE(addr))
+ 		return addr;
++	/* A ghost region has leaf PTEs but intentionally no VMA: never let a
++	 * normal mmap place metadata over it. */
++	if (gh_ghost_region_overlaps(mm, addr, len))
++		return -EBUSY;
+ 
+ 	if (flags & MAP_FIXED_NOREPLACE) {
+ 		if (find_vma_intersection(mm, addr, addr + len))
+@@ -2741,6 +2746,8 @@ int do_mas_munmap(struct ma_state *mas, struct mm_struct *mm,
+ 	end = start + PAGE_ALIGN(len);
+ 	if (end == start)
+ 		return -EINVAL;
++	if (gh_ghost_region_overlaps(mm, start, end - start))
++		return -EBUSY;
+ 
+ 	 /* arch_unmap() might do unmaps itself.  */
+ 	arch_unmap(mm, start, end);
+@@ -3395,6 +3402,8 @@ void exit_mmap(struct mm_struct *mm)
+ 
+ 	trace_exit_mmap(mm);
+ destroy:
++	/* This is reached with mmap_write_lock(mm); no users remain in mm. */
++	gh_ghost_region_mm_exit(mm);
+ 	__mt_destroy(&mm->mm_mt);
+ 	mmap_write_unlock(mm);
+ 	vm_unacct_memory(nr_accounted);
+diff --git a/mm/mprotect.c b/mm/mprotect.c
+index 477bf6870103..0c40d80d29b7 100644
+--- a/mm/mprotect.c
++++ b/mm/mprotect.c
+@@ -734,6 +734,10 @@ static int do_mprotect_pkey(unsigned long start, size_t len,
+ 
+ 	if (mmap_write_lock_killable(current->mm))
+ 		return -EINTR;
++	if (gh_ghost_region_overlaps(current->mm, start, end - start)) {
++		error = -EBUSY;
++		goto out;
++	}
+ 
+ 	/*
+ 	 * If userspace did not allocate the pkey, do not let
+diff --git a/mm/mremap.c b/mm/mremap.c
+index a204381a0eb0..f989d8cc8a1b 100644
+--- a/mm/mremap.c
++++ b/mm/mremap.c
+@@ -9,6 +9,7 @@
+  */
+ 
+ #include <linux/mm.h>
++#include <linux/ghosthook.h>
+ #include <linux/mm_inline.h>
+ #include <linux/hugetlb.h>
+ #include <linux/shm.h>
+@@ -871,6 +872,10 @@ static unsigned long mremap_to(unsigned long addr, unsigned long old_len,
+ 	/* We got a new mapping */
+ 	if (!(flags & MREMAP_FIXED))
+ 		new_addr = ret;
++	if (gh_ghost_region_overlaps(mm, new_addr, new_len)) {
++		ret = -EBUSY;
++		goto out;
++	}
+ 
+ 	ret = move_vma(vma, addr, old_len, new_len, new_addr, locked, flags, uf,
+ 		       uf_unmap);
+@@ -1025,11 +1030,14 @@ SYSCALL_DEFINE5(mremap, unsigned long, addr, unsigned long, old_len,
+ 	/* old_len exactly to the end of the area..
+ 	 */
+ 	if (old_len == vma->vm_end - addr) {
++		unsigned long extension_start = addr + old_len;
++		unsigned long extension_end = addr + new_len;
++
+ 		/* can we just expand the current mapping? */
+-		if (vma_expandable(vma, new_len - old_len)) {
++		if (!gh_ghost_region_overlaps(mm, extension_start,
++					      new_len - old_len) &&
++		    vma_expandable(vma, new_len - old_len)) {
+ 			long pages = (new_len - old_len) >> PAGE_SHIFT;
+-			unsigned long extension_start = addr + old_len;
+-			unsigned long extension_end = addr + new_len;
+ 			pgoff_t extension_pgoff = vma->vm_pgoff +
+ 				((extension_start - vma->vm_start) >> PAGE_SHIFT);
+ 
