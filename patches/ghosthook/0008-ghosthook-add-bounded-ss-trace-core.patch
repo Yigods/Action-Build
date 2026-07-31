@@ -1,0 +1,395 @@
+From 16f6a390b1d2ghosthook Mon Sep 17 00:00:00 2001
+From: no_trace <no_trace@local>
+Date: Fri, 31 Jul 2026 07:20:00 +0800
+Subject: [PATCH] arm64: add bounded pinned EL0 single-step trace core
+
+Add a second permanent debug-router consumer which implements a deliberately
+bounded, one-TID EL0 hardware-single-step trace. The control API pins the
+target to its current CPU, preserves/restores its affinity on normal stop,
+records a fixed number of register snapshots in a static ring, and releases
+all state during task exit. KPM controls only the exported API and never owns
+an exception callback.
+
+This is a trace primitive, not a DBI engine: one session, native EL0 only,
+128-record maximum, no instruction rewriting and no user-memory modification.
+---
+diff --git a/arch/arm64/kernel/Makefile b/arch/arm64/kernel/Makefile
+index 18eb315..935012b 100644
+--- a/arch/arm64/kernel/Makefile
++++ b/arch/arm64/kernel/Makefile
+@@ -54,6 +54,7 @@ obj-$(CONFIG_MODULES)			+= module.o
+ obj-$(CONFIG_ARM64_MODULE_PLTS)		+= module-plts.o
+ obj-$(CONFIG_PERF_EVENTS)		+= perf_regs.o perf_callchain.o
+ obj-$(CONFIG_HAVE_HW_BREAKPOINT)	+= hw_breakpoint.o
++obj-$(CONFIG_HAVE_HW_BREAKPOINT)	+= gh_ss_trace.o
+ obj-$(CONFIG_CPU_PM)			+= sleep.o suspend.o
+ obj-$(CONFIG_CPU_IDLE)			+= cpuidle.o
+ obj-$(CONFIG_JUMP_LABEL)		+= jump_label.o
+diff --git a/include/linux/ghosthook.h b/include/linux/ghosthook.h
+index 1bddc8a..d4c2e42 100644
+--- a/include/linux/ghosthook.h
++++ b/include/linux/ghosthook.h
+@@ -71,4 +71,20 @@ int gh_hwbp_direct_read_trace(int cpu, unsigned long *cursor,
+ /* Called by do_exit() while the exiting task is still current on its CPU. */
+ void gh_hwbp_direct_task_exit(struct task_struct *task);
+ 
++/* Bounded continuous EL0 hardware-single-step trace, one pinned TID. */
++struct gh_ss_trace_stats {
++	pid_t tid;
++	unsigned long hits;
++	unsigned long limit;
++	int cpu;
++	int active;
++};
++int gh_ss_trace_arm(pid_t tid, unsigned long limit);
++int gh_ss_trace_stop(pid_t tid);
++int gh_ss_trace_get_stats(struct gh_ss_trace_stats *stats);
++int gh_ss_trace_read(int cpu, unsigned long *cursor,
++		     struct gh_hwbp_direct_trace *records, unsigned int max_records,
++		     unsigned int *copied, unsigned long *dropped);
++void gh_ss_trace_task_exit(struct task_struct *task);
++
+ #endif /* _LINUX_GHOSTHOOK_H */
+diff --git a/kernel/exit.c b/kernel/exit.c
+index 04d0db7..a458f27 100644
+--- a/kernel/exit.c
++++ b/kernel/exit.c
+@@ -832,6 +832,7 @@ void __noreturn do_exit(long code)
+ 	exit_signals(tsk);  /* sets PF_EXITING */
+ 	/* Release a direct GhostHook BRP before this task's mm disappears. */
+ 	gh_hwbp_direct_task_exit(tsk);
++	gh_ss_trace_task_exit(tsk);
+ 
+ 	trace_android_vh_exit_check(current);
+ 
+diff --git a/arch/arm64/kernel/gh_ss_trace.c b/arch/arm64/kernel/gh_ss_trace.c
+new file mode 100644
+index 0000000..90ac95b
+--- /dev/null
++++ b/arch/arm64/kernel/gh_ss_trace.c
+@@ -0,0 +1,323 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Controlled EL0 hardware-single-step trace backend.  It is a permanent
++ * built-in debug-router consumer; KPM only controls the exported session API
++ * and never owns an exception callback.  One TID is pinned to one CPU, trace
++ * records live in a bounded static ring, and the configured step budget makes
++ * the experiment self-terminating.
++ */
++#include <linux/cpu.h>
++#include <linux/cpumask.h>
++#include <linux/errno.h>
++#include <linux/ghosthook.h>
++#include <linux/init.h>
++#include <linux/pid.h>
++#include <linux/smp.h>
++#include <linux/spinlock.h>
++#include <linux/sched.h>
++
++#include <asm/current.h>
++#include <asm/debug-monitors.h>
++#include <asm/traps.h>
++
++#define GH_SS_TRACE_CAP 128
++
++struct gh_ss_trace_ring {
++	unsigned long head;
++	unsigned long tail;
++	unsigned long dropped;
++	struct gh_hwbp_direct_trace records[GH_SS_TRACE_CAP];
++};
++
++struct gh_ss_trace_state {
++	struct pid *pid;
++	cpumask_t saved_mask;
++	unsigned long limit;
++	unsigned long hits;
++	int cpu;
++	bool active;
++	bool ss_owned;
++	bool affinity_saved;
++};
++
++static DEFINE_RAW_SPINLOCK(gh_ss_trace_lock);
++static struct gh_ss_trace_state gh_ss_trace;
++static struct gh_ss_trace_ring gh_ss_trace_ring;
++static bool gh_ss_trace_router_ready;
++
++static bool gh_ss_trace_task_matches(struct task_struct *task)
++{
++	return gh_ss_trace.pid && task_pid(task) == gh_ss_trace.pid;
++}
++
++static void gh_ss_trace_reset_locked(void)
++{
++	gh_ss_trace_ring.head = 0;
++	gh_ss_trace_ring.tail = 0;
++	gh_ss_trace_ring.dropped = 0;
++}
++
++/* Called under gh_ss_trace_lock from EL0 debug exception context. */
++static void gh_ss_trace_record_locked(struct pt_regs *regs)
++{
++	struct gh_hwbp_direct_trace *record;
++	unsigned long sequence;
++	int i;
++
++	sequence = ++gh_ss_trace_ring.head;
++	if (!gh_ss_trace_ring.tail)
++		gh_ss_trace_ring.tail = sequence;
++	else if (sequence - gh_ss_trace_ring.tail >= GH_SS_TRACE_CAP) {
++		gh_ss_trace_ring.tail++;
++		gh_ss_trace_ring.dropped++;
++	}
++	record = &gh_ss_trace_ring.records[(sequence - 1) % GH_SS_TRACE_CAP];
++	record->sequence = sequence;
++	record->tid = pid_nr(gh_ss_trace.pid);
++	record->cpu = raw_smp_processor_id();
++	record->pc = instruction_pointer(regs);
++	record->sp = regs->sp;
++	record->pstate = regs->pstate;
++	for (i = 0; i < GH_HWBP_DIRECT_TRACE_GPRS; ++i)
++		record->regs[i] = regs->regs[i];
++}
++
++static void gh_ss_trace_sync_current(void *unused)
++{
++	unsigned long flags;
++	bool enable = false;
++
++	(void)unused;
++	raw_spin_lock_irqsave(&gh_ss_trace_lock, flags);
++	if (gh_ss_trace.active && gh_ss_trace.ss_owned &&
++	    gh_ss_trace_task_matches(current))
++		enable = true;
++	raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
++	if (enable)
++		user_enable_single_step(current);
++	else
++		user_disable_single_step(current);
++}
++
++static bool gh_ss_trace_debug_event(unsigned long addr_if_watchpoint,
++		unsigned long esr, struct pt_regs *regs, void *context)
++{
++	unsigned long flags;
++	bool consumed = false;
++
++	(void)addr_if_watchpoint;
++	(void)context;
++	if (!user_mode(regs) || DBG_ESR_EVT(esr) != DBG_ESR_EVT_HWSS)
++		return false;
++	raw_spin_lock_irqsave(&gh_ss_trace_lock, flags);
++	if (!gh_ss_trace.active || !gh_ss_trace.ss_owned ||
++	    !gh_ss_trace_task_matches(current))
++		goto out;
++	gh_ss_trace_record_locked(regs);
++	gh_ss_trace.hits++;
++	if (gh_ss_trace.hits >= gh_ss_trace.limit) {
++		/* The bounded session owns this SS request and may clear it. */
++		user_disable_single_step(current);
++		gh_ss_trace.ss_owned = false;
++		gh_ss_trace.active = false;
++	}
++	consumed = true;
++out:
++	raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
++	return consumed;
++}
++
++int gh_ss_trace_arm(pid_t tid, unsigned long limit)
++{
++	struct gh_hwbp_direct_stats direct;
++	struct task_struct *task;
++	struct pid *pid;
++	unsigned long flags;
++	int cpu;
++	int ret;
++	cpumask_t saved_mask;
++
++	if (tid <= 0 || !limit || limit > GH_SS_TRACE_CAP)
++		return -EINVAL;
++	if (!READ_ONCE(gh_ss_trace_router_ready))
++		return -EOPNOTSUPP;
++	ret = gh_hwbp_direct_get_stats(&direct);
++	if (ret)
++		return ret;
++	if (direct.armed)
++		return -EBUSY;
++	pid = find_get_pid(tid);
++	if (!pid)
++		return -ESRCH;
++	task = get_pid_task(pid, PIDTYPE_PID);
++	if (!task) {
++		put_pid(pid);
++		return -ESRCH;
++	}
++	if (test_tsk_thread_flag(task, TIF_SINGLESTEP)) {
++		put_task_struct(task);
++		put_pid(pid);
++		return -EBUSY;
++	}
++	cpu = task_cpu(task);
++	if (!cpu_online(cpu)) {
++		put_task_struct(task);
++		put_pid(pid);
++		return -EAGAIN;
++	}
++	/* Control path only: retain the original mask and pin before SS is set. */
++	cpumask_copy(&saved_mask, task->cpus_ptr);
++	ret = set_cpus_allowed_ptr(task, cpumask_of(cpu));
++	if (ret) {
++		put_task_struct(task);
++		put_pid(pid);
++		return ret;
++	}
++	raw_spin_lock_irqsave(&gh_ss_trace_lock, flags);
++	if (gh_ss_trace.pid) {
++		raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
++		(void)set_cpus_allowed_ptr(task, &saved_mask);
++		put_task_struct(task);
++		put_pid(pid);
++		return -EBUSY;
++	}
++	gh_ss_trace.pid = pid;
++	cpumask_copy(&gh_ss_trace.saved_mask, &saved_mask);
++	gh_ss_trace.limit = limit;
++	gh_ss_trace.hits = 0;
++	gh_ss_trace.cpu = cpu;
++	gh_ss_trace.active = true;
++	gh_ss_trace.ss_owned = true;
++	gh_ss_trace.affinity_saved = true;
++	gh_ss_trace_reset_locked();
++	raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
++	user_enable_single_step(task);
++	/* Apply SS immediately if the pinned target happens to be running. */
++	smp_call_function_single(cpu, gh_ss_trace_sync_current, NULL, 1);
++	put_task_struct(task);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(gh_ss_trace_arm);
++
++int gh_ss_trace_stop(pid_t tid)
++{
++	struct task_struct *task;
++	struct pid *owned;
++	cpumask_t saved_mask;
++	unsigned long flags;
++	int cpu;
++	bool restore;
++
++	if (tid <= 0)
++		return -EINVAL;
++	raw_spin_lock_irqsave(&gh_ss_trace_lock, flags);
++	if (!gh_ss_trace.pid || pid_nr(gh_ss_trace.pid) != tid) {
++		raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
++		return -ENOENT;
++	}
++	owned = gh_ss_trace.pid;
++	cpu = gh_ss_trace.cpu;
++	restore = gh_ss_trace.affinity_saved;
++	cpumask_copy(&saved_mask, &gh_ss_trace.saved_mask);
++	gh_ss_trace.active = false;
++	gh_ss_trace.ss_owned = false;
++	gh_ss_trace.pid = NULL;
++	gh_ss_trace.affinity_saved = false;
++	raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
++	task = get_pid_task(owned, PIDTYPE_PID);
++	if (task) {
++		user_disable_single_step(task);
++		if (cpu_online(cpu))
++			smp_call_function_single(cpu, gh_ss_trace_sync_current, NULL, 1);
++		if (restore)
++			(void)set_cpus_allowed_ptr(task, &saved_mask);
++		put_task_struct(task);
++	}
++	put_pid(owned);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(gh_ss_trace_stop);
++
++int gh_ss_trace_get_stats(struct gh_ss_trace_stats *stats)
++{
++	unsigned long flags;
++
++	if (!stats)
++		return -EINVAL;
++	raw_spin_lock_irqsave(&gh_ss_trace_lock, flags);
++	stats->tid = gh_ss_trace.pid ? pid_nr(gh_ss_trace.pid) : 0;
++	stats->hits = gh_ss_trace.hits;
++	stats->limit = gh_ss_trace.limit;
++	stats->cpu = gh_ss_trace.cpu;
++	stats->active = gh_ss_trace.active;
++	raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(gh_ss_trace_get_stats);
++
++int gh_ss_trace_read(int cpu, unsigned long *cursor,
++		     struct gh_hwbp_direct_trace *records, unsigned int max_records,
++		     unsigned int *copied, unsigned long *dropped)
++{
++	unsigned long flags, next, start, end;
++	unsigned int count = 0;
++
++	if (!cursor || !records || !copied || !dropped || !max_records)
++		return -EINVAL;
++	raw_spin_lock_irqsave(&gh_ss_trace_lock, flags);
++	if (cpu != gh_ss_trace.cpu && gh_ss_trace.pid) {
++		raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
++		return -EINVAL;
++	}
++	start = gh_ss_trace_ring.tail;
++	end = gh_ss_trace_ring.head;
++	next = *cursor;
++	*dropped = 0;
++	if (next && start && next < start) {
++		*dropped = start - next;
++		next = start;
++	}
++	if (!next)
++		next = start;
++	while (next && next <= end && count < max_records) {
++		records[count++] = gh_ss_trace_ring.records[(next - 1) % GH_SS_TRACE_CAP];
++		next++;
++	}
++	*cursor = next;
++	*copied = count;
++	*dropped += gh_ss_trace_ring.dropped;
++	raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
++	return 0;
++}
++EXPORT_SYMBOL_GPL(gh_ss_trace_read);
++
++void gh_ss_trace_task_exit(struct task_struct *task)
++{
++	struct pid *owned = NULL;
++	unsigned long flags;
++
++	if (task != current)
++		return;
++	raw_spin_lock_irqsave(&gh_ss_trace_lock, flags);
++	if (gh_ss_trace.pid && gh_ss_trace_task_matches(task)) {
++		user_disable_single_step(task);
++		owned = gh_ss_trace.pid;
++		gh_ss_trace.pid = NULL;
++		gh_ss_trace.active = false;
++		gh_ss_trace.ss_owned = false;
++		gh_ss_trace.affinity_saved = false;
++	}
++	raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
++	if (owned)
++		put_pid(owned);
++}
++
++static int __init gh_ss_trace_init(void)
++{
++	int ret = gh_debug_router_register_core(gh_ss_trace_debug_event, NULL);
++	if (ret)
++		return ret;
++	WRITE_ONCE(gh_ss_trace_router_ready, true);
++	return 0;
++}
++late_initcall(gh_ss_trace_init);
+-- 
+2.43.0

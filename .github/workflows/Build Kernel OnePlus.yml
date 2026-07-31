@@ -83,7 +83,7 @@ on:
           - N/A
       GH_GHOSTHOOK_ROUTER_6118:
         type: boolean
-        description: "GhostHook: pin PKG110 6.1.118 source and add r9 explicit fault/debug core chain (test-only)"
+        description: "GhostHook: pin PKG110 6.1.118 source and add r10 bounded single-step trace core (test-only)"
         required: true
         default: false
       SUSFS_META:
@@ -518,6 +518,9 @@ jobs:
             curl --fail --location --silent --show-error \
               "$GH_PATCH_BASE/0007-ghosthook-add-debug-core-chain.patch" \
               -o "$GH_PATCH_DIR/0007-ghosthook-add-debug-core-chain.patch"
+            curl --fail --location --silent --show-error \
+              "$GH_PATCH_BASE/0008-ghosthook-add-bounded-ss-trace-core.patch" \
+              -o "$GH_PATCH_DIR/0008-ghosthook-add-bounded-ss-trace-core.patch"
             curl --fail --location --silent --show-error \
               "$GH_PATCH_BASE/apply_explicit_router.sh" \
               -o "$GH_PATCH_DIR/apply_explicit_router.sh"
