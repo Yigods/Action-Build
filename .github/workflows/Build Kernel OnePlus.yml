@@ -493,7 +493,7 @@ jobs:
             # workflow_dispatch can execute a selected workflow file while
             # actions/checkout still supplies the repository default tree.
             # Fetch the reviewed patch stack from its immutable content commit.
-            GH_PATCH_REF=a4c5cdfa86c4c13983a9bfb179e4c142fda1d141
+            GH_PATCH_REF=38110ea7e13aa8f76468df672eee8188c15e5997
             GH_PATCH_BASE="https://raw.githubusercontent.com/Yigods/Action-Build/${GH_PATCH_REF}/patches/ghosthook"
             GH_PATCH_DIR="$PWD/.ghosthook-router-patch"
             mkdir -p "$GH_PATCH_DIR"
