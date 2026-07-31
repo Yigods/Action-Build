@@ -1,0 +1,99 @@
+From 8d8a67a8c9b1ghosthook Mon Sep 17 00:00:00 2001
+From: no_trace <no_trace@local>
+Date: Fri, 31 Jul 2026 06:30:00 +0800
+Subject: [PATCH] arm64: chain two permanent GhostHook debug consumers
+
+The r8 direct-HWBP backend occupies the single built-in debug-router slot.
+Continuous single-step tracing must be a separate permanent core consumer so
+it can arbitrate before the optional KPM callback, rather than replacing the
+direct owner or installing exception code from unloadable KPM text.
+
+Keep dispatch serialized by the existing raw lock and preserve first-consumer
+wins semantics. This patch only establishes the two-slot core chain; it does
+not yet register a continuous-trace backend.
+---
+diff --git a/arch/arm64/mm/fault.c b/arch/arm64/mm/fault.c
+index 2b5383a..6760a74 100755
+--- a/arch/arm64/mm/fault.c
++++ b/arch/arm64/mm/fault.c
+@@ -927,23 +927,32 @@ struct gh_debug_router_binding {
+ 
+ static DEFINE_RAW_SPINLOCK(gh_debug_router_lock);
+ static struct gh_debug_router_binding gh_debug_router_binding;
+-/* Core callbacks are built into the kernel and never point into KPM text. */
+-static struct gh_debug_router_binding gh_debug_router_core_binding;
++/*
++ * Built-in consumers never point into KPM text.  Keep a small ordered core
++ * chain so permanent one-shot/continuous trace backends can arbitrate before
++ * the optional KPM consumer without replacing the direct-HWBP owner.
++ */
++#define GH_DEBUG_ROUTER_CORE_MAX 2
++static struct gh_debug_router_binding
++    gh_debug_router_core_binding[GH_DEBUG_ROUTER_CORE_MAX];
+ 
+ int gh_debug_router_register_core(gh_debug_router_fn_t fn, void *context)
+ {
+ 	unsigned long flags;
+-	int ret = 0;
++	unsigned int i;
++	int ret = -EBUSY;
+ 
+ 	if (!fn)
+ 		return -EINVAL;
+ 
+ 	raw_spin_lock_irqsave(&gh_debug_router_lock, flags);
+-	if (READ_ONCE(gh_debug_router_core_binding.fn))
+-		ret = -EBUSY;
+-	else {
+-		WRITE_ONCE(gh_debug_router_core_binding.context, context);
+-		WRITE_ONCE(gh_debug_router_core_binding.fn, fn);
++	for (i = 0; i < GH_DEBUG_ROUTER_CORE_MAX; ++i) {
++		if (READ_ONCE(gh_debug_router_core_binding[i].fn))
++			continue;
++		WRITE_ONCE(gh_debug_router_core_binding[i].context, context);
++		WRITE_ONCE(gh_debug_router_core_binding[i].fn, fn);
++		ret = 0;
++		break;
+ 	}
+ 	raw_spin_unlock_irqrestore(&gh_debug_router_lock, flags);
+ 	return ret;
+@@ -995,13 +1004,16 @@ static bool __nocfi gh_debug_router_dispatch(unsigned long addr_if_watchpoint,
+ 	unsigned long flags;
+ 	gh_debug_router_fn_t fn;
+ 	void *context;
++	unsigned int i;
+ 	bool consumed = false;
+ 
+ 	raw_spin_lock_irqsave(&gh_debug_router_lock, flags);
+-	fn = READ_ONCE(gh_debug_router_core_binding.fn);
+-	context = READ_ONCE(gh_debug_router_core_binding.context);
+-	if (fn)
+-		consumed = fn(addr_if_watchpoint, esr, regs, context);
++	for (i = 0; i < GH_DEBUG_ROUTER_CORE_MAX && !consumed; ++i) {
++		fn = READ_ONCE(gh_debug_router_core_binding[i].fn);
++		context = READ_ONCE(gh_debug_router_core_binding[i].context);
++		if (fn)
++			consumed = fn(addr_if_watchpoint, esr, regs, context);
++	}
+ 	if (!consumed) {
+ 		fn = READ_ONCE(gh_debug_router_binding.fn);
+ 		context = READ_ONCE(gh_debug_router_binding.context);
+diff --git a/include/linux/ghosthook.h b/include/linux/ghosthook.h
+index c35e9c0..1bddc8a
+--- a/include/linux/ghosthook.h
++++ b/include/linux/ghosthook.h
+@@ -31,7 +31,11 @@ int gh_fault_router_unregister(gh_fault_router_fn_t fn, void *context);
+ typedef bool (*gh_debug_router_fn_t)(unsigned long addr_if_watchpoint,
+ 			     unsigned long esr, struct pt_regs *regs, void *context);
+ 
+-/* Register one permanent built-in consumer before the optional KPM consumer. */
++/*
++ * Register up to two ordered permanent built-in consumers before the optional
++ * KPM consumer.  A callback consumes only events it fully emulates; false
++ * falls through to the next core consumer and then the optional KPM slot.
++ */
+ int gh_debug_router_register_core(gh_debug_router_fn_t fn, void *context);
+ int gh_debug_router_register(gh_debug_router_fn_t fn, void *context);
+ int gh_debug_router_unregister(gh_debug_router_fn_t fn, void *context);
+-- 
+2.43.0
