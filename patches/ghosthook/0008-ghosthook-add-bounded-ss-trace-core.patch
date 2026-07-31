@@ -67,7 +67,7 @@ new file mode 100644
 index 0000000..90ac95b
 --- /dev/null
 +++ b/arch/arm64/kernel/gh_ss_trace.c
-@@ -0,0 +1,323 @@
+@@ -0,0 +1,324 @@
 +// SPDX-License-Identifier: GPL-2.0-only
 +/*
 + * Controlled EL0 hardware-single-step trace backend.  It is a permanent
