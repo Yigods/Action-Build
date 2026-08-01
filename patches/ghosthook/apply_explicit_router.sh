@@ -37,7 +37,8 @@ for patch in \
     "$self_dir/0015-ghosthook-rewind-ss-after-consumed-event.patch" \
     "$self_dir/0016-ghosthook-clear-pending-ss-on-stop.patch" \
     "$self_dir/0017-ghosthook-scalar-write-and-ss-fastforward.patch" \
-    "$self_dir/0018-ghosthook-commit-emitted-ghost-writes.patch"; do
+    "$self_dir/0018-ghosthook-commit-emitted-ghost-writes.patch" \
+    "$self_dir/0019-ghosthook-disarm-final-ss-in-exception.patch"; do
     [ -f "$patch" ] || { echo "missing patch: $patch" >&2; exit 5; }
     git -C "$common" apply --check "$patch"
     git -C "$common" apply "$patch"
@@ -65,6 +66,7 @@ grep -q 'gh_ghost_region_write_u32' "$common/mm/gh_ghost.c"
 grep -q 'gh_ghost_region_write_u32' "$common/include/linux/ghosthook.h"
 grep -q 'user_fastforward_single_step(current)' "$common/arch/arm64/kernel/gh_ss_trace.c"
 grep -q 'WRITE_ONCE(.*page_address(region->pages\[page\])' "$common/mm/gh_ghost.c"
+grep -q 'Clear both the pending SPSR.SS bit' "$common/arch/arm64/kernel/gh_ss_trace.c"
 grep -q 'GH_GHOST_MAX_REGIONS_PER_MM' "$common/mm/gh_ghost.c"
 grep -q 'VM_MAYWRITE | VM_SHARED' "$common/mm/gh_ghost.c"
 grep -q 'gh_ghost_region_overlaps' "$common/mm/mmap.c"
