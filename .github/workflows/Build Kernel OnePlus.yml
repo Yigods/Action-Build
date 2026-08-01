@@ -544,6 +544,9 @@ jobs:
               "$GH_PATCH_BASE/0015-ghosthook-rewind-ss-after-consumed-event.patch" \
               -o "$GH_PATCH_DIR/0015-ghosthook-rewind-ss-after-consumed-event.patch"
             curl --fail --location --silent --show-error \
+              "$GH_PATCH_BASE/0016-ghosthook-clear-pending-ss-on-stop.patch" \
+              -o "$GH_PATCH_DIR/0016-ghosthook-clear-pending-ss-on-stop.patch"
+            curl --fail --location --silent --show-error \
               "$GH_PATCH_BASE/apply_explicit_router.sh" \
               -o "$GH_PATCH_DIR/apply_explicit_router.sh"
             chmod 0755 "$GH_PATCH_DIR/apply_explicit_router.sh"

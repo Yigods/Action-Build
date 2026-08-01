@@ -34,7 +34,8 @@ for patch in \
     "$self_dir/0012-ghosthook-add-passive-undef-trace.patch" \
     "$self_dir/0013-ghosthook-allow-bounded-code-data-pair.patch" \
     "$self_dir/0014-ghosthook-make-rw-data-pte-writable.patch" \
-    "$self_dir/0015-ghosthook-rewind-ss-after-consumed-event.patch"; do
+    "$self_dir/0015-ghosthook-rewind-ss-after-consumed-event.patch" \
+    "$self_dir/0016-ghosthook-clear-pending-ss-on-stop.patch"; do
     [ -f "$patch" ] || { echo "missing patch: $patch" >&2; exit 5; }
     git -C "$common" apply --check "$patch"
     git -C "$common" apply "$patch"
@@ -54,6 +55,7 @@ grep -q 'GH_DEBUG_ROUTER_CORE_MAX 2' "$common/arch/arm64/mm/fault.c"
 grep -q 'gh_ss_trace_arm' "$common/arch/arm64/kernel/gh_ss_trace.c"
 grep -q 'gh_ss_trace_arm_work' "$common/arch/arm64/kernel/gh_ss_trace.c"
 grep -q 'user_rewind_single_step(current)' "$common/arch/arm64/kernel/gh_ss_trace.c"
+grep -q 'clear_regs_spsr_ss(regs)' "$common/arch/arm64/kernel/gh_ss_trace.c"
 grep -q 'task_work_add' "$common/arch/arm64/kernel/gh_ss_trace.c"
 grep -q 'gh_ss_trace_register_router' "$common/arch/arm64/kernel/hw_breakpoint.c"
 grep -q 'gh_ghost_region_create' "$common/mm/gh_ghost.c"
