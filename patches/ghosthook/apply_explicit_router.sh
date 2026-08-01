@@ -58,7 +58,9 @@ grep -q 'GH_DEBUG_ROUTER_CORE_MAX 2' "$common/arch/arm64/mm/fault.c"
 grep -q 'gh_ss_trace_arm' "$common/arch/arm64/kernel/gh_ss_trace.c"
 grep -q 'gh_ss_trace_arm_work' "$common/arch/arm64/kernel/gh_ss_trace.c"
 grep -q 'user_rewind_single_step(current)' "$common/arch/arm64/kernel/gh_ss_trace.c"
-grep -q 'task_work_add(current, &gh_ss_trace.disarm_work, TWA_RESUME)' "$common/arch/arm64/kernel/gh_ss_trace.c"
+# Explicit stop still uses task_work for a remote target; the final owned
+# HWSS is intentionally disarmed directly in its exception context.
+grep -q 'task_work_add(task, &gh_ss_trace.disarm_work, TWA_RESUME)' "$common/arch/arm64/kernel/gh_ss_trace.c"
 grep -q 'task_work_add' "$common/arch/arm64/kernel/gh_ss_trace.c"
 grep -q 'gh_ss_trace_register_router' "$common/arch/arm64/kernel/hw_breakpoint.c"
 grep -q 'gh_ghost_region_create' "$common/mm/gh_ghost.c"
