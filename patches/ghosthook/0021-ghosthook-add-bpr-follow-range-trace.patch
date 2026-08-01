@@ -1,0 +1,171 @@
+--- a/include/linux/ghosthook.h
++++ b/include/linux/ghosthook.h
+@@ -93,6 +93,9 @@
+ };
+ 
+ int gh_hwbp_direct_arm(pid_t tid, unsigned long pc);
++/* Follow one exact EL0 PC at a time using BPR -> one owned HWSS -> next BPR. */
++int gh_hwbp_direct_follow_arm(pid_t tid, unsigned long entry,
++				      unsigned long end, unsigned long limit);
+ int gh_hwbp_direct_disarm(pid_t tid);
+ int gh_hwbp_direct_get_stats(struct gh_hwbp_direct_stats *stats);
+ int gh_hwbp_direct_read_trace(int cpu, unsigned long *cursor,
+--- a/arch/arm64/kernel/hw_breakpoint.c
++++ b/arch/arm64/kernel/hw_breakpoint.c
+@@ -56,6 +56,11 @@
+ 	struct pid *pid;
+ 	unsigned long pc;
+ 	unsigned long hits;
++	/* FOLLOW keeps the BRP at the next in-range EL0 PC between single steps. */
++	unsigned long range_start;
++	unsigned long range_end;
++	unsigned long limit;
++	bool follow;
+ 	int slot;
+ 	int last_cpu;
+ 	bool active;
+@@ -195,6 +200,7 @@
+ 	unsigned long flags;
+ 	unsigned long pc;
+ 	unsigned int event = DBG_ESR_EVT(esr);
++	struct pid *finished = NULL;
+ 	bool consumed = false;
+ 
+ 	(void)addr_if_watchpoint;
+@@ -208,15 +214,14 @@
+ 		goto out;
+ 
+ 	if (event == DBG_ESR_EVT_HWBP && !gh_hwbp_direct.disarming &&
+-	    !gh_hwbp_direct.stepping &&
+-	    pc == gh_hwbp_direct.pc) {
++	    !gh_hwbp_direct.stepping && pc == gh_hwbp_direct.pc) {
+ 		if (test_thread_flag(TIF_SINGLESTEP)) {
+ 			/* Do not consume or clear another single-step user's state. */
+ 			write_wb_reg(AARCH64_DBG_REG_BCR, gh_hwbp_direct.slot, 0);
+ 			gh_hwbp_direct.ss_conflicted = true;
+ 			goto out;
+ 		}
+-		/* Disable this exact BRP, execute one original instruction, rearm. */
++		/* Disable this exact BRP and execute exactly one original instruction. */
+ 		write_wb_reg(AARCH64_DBG_REG_BCR, gh_hwbp_direct.slot, 0);
+ 		gh_hwbp_direct.hits++;
+ 		gh_hwbp_direct_record_trace(regs);
+@@ -229,7 +234,37 @@
+ 		gh_hwbp_direct.stepping = false;
+ 		gh_hwbp_direct.ss_owned = false;
+ 		user_disable_single_step(current);
+-		if (!gh_hwbp_direct.disarming && !gh_hwbp_direct.ss_conflicted) {
++		if (gh_hwbp_direct.follow) {
++			/*
++			 * BPR-follow never returns to EL0 with an owned SS pending.  The
++			 * next BPR is the post-instruction PC; an out-of-range PC or the
++			 * requested budget completes locally and releases the reserved slot.
++			 */
++			if (gh_hwbp_direct.hits >= gh_hwbp_direct.limit ||
++			    pc < gh_hwbp_direct.range_start ||
++			    pc >= gh_hwbp_direct.range_end) {
++				write_wb_reg(AARCH64_DBG_REG_BCR, gh_hwbp_direct.slot, 0);
++				if (this_cpu_read(gh_hwbp_direct_cpu_enabled)) {
++					disable_debug_monitors(DBG_ACTIVE_EL0);
++					this_cpu_write(gh_hwbp_direct_cpu_enabled, false);
++				}
++				finished = gh_hwbp_direct.pid;
++				gh_hwbp_direct.pid = NULL;
++				gh_hwbp_direct.pc = 0;
++				gh_hwbp_direct.range_start = 0;
++				gh_hwbp_direct.range_end = 0;
++				gh_hwbp_direct.limit = 0;
++				gh_hwbp_direct.follow = false;
++				gh_hwbp_direct.slot = -1;
++				gh_hwbp_direct.last_cpu = raw_smp_processor_id();
++				gh_hwbp_direct.active = false;
++			} else {
++				gh_hwbp_direct.pc = pc;
++				write_wb_reg(AARCH64_DBG_REG_BVR, gh_hwbp_direct.slot, pc);
++				write_wb_reg(AARCH64_DBG_REG_BCR, gh_hwbp_direct.slot,
++						     gh_hwbp_direct_ctrl());
++			}
++		} else if (!gh_hwbp_direct.disarming && !gh_hwbp_direct.ss_conflicted) {
+ 			write_wb_reg(AARCH64_DBG_REG_BVR, gh_hwbp_direct.slot,
+ 				     gh_hwbp_direct.pc);
+ 			write_wb_reg(AARCH64_DBG_REG_BCR, gh_hwbp_direct.slot,
+@@ -239,10 +274,12 @@
+ 	}
+ out:
+ 	raw_spin_unlock_irqrestore(&gh_hwbp_direct_lock, flags);
++	if (finished)
++		put_pid(finished);
+ 	return consumed;
+ }
+-
+-int gh_hwbp_direct_arm(pid_t tid, unsigned long pc)
++static int gh_hwbp_direct_arm_common(pid_t tid, unsigned long pc,
++				       unsigned long end, unsigned long limit, bool follow)
+ {
+ 	struct task_struct *task;
+ 	struct pid *pid;
+@@ -250,7 +287,9 @@
+ 	int cpu;
+ 	int slot;
+ 
+-	if (tid <= 0 || (pc & 0x3))
++	if (tid <= 0 || (pc & 0x3) ||
++	    (follow && (!limit || end <= pc || (end & 0x3) ||
++			limit > GH_HWBP_DIRECT_TRACE_CAP)))
+ 		return -EINVAL;
+ 	if (!gh_hwbp_direct_router_ready || core_num_brps < 2)
+ 		return -EOPNOTSUPP;
+@@ -294,6 +333,10 @@
+ 	gh_hwbp_direct.pid = pid;
+ 	gh_hwbp_direct.pc = pc;
+ 	gh_hwbp_direct.hits = 0;
++	gh_hwbp_direct.range_start = follow ? pc : 0;
++	gh_hwbp_direct.range_end = follow ? end : 0;
++	gh_hwbp_direct.limit = follow ? limit : 0;
++	gh_hwbp_direct.follow = follow;
+ 	gh_hwbp_direct.slot = slot;
+ 	gh_hwbp_direct.last_cpu = -1;
+ 	gh_hwbp_direct.disarming = false;
+@@ -309,8 +352,20 @@
+ 	put_task_struct(task);
+ 	return 0;
+ }
++
++int gh_hwbp_direct_arm(pid_t tid, unsigned long pc)
++{
++	return gh_hwbp_direct_arm_common(tid, pc, 0, 0, false);
++}
+ EXPORT_SYMBOL_GPL(gh_hwbp_direct_arm);
+ 
++int gh_hwbp_direct_follow_arm(pid_t tid, unsigned long entry,
++				      unsigned long end, unsigned long limit)
++{
++	return gh_hwbp_direct_arm_common(tid, entry, end, limit, true);
++}
++EXPORT_SYMBOL_GPL(gh_hwbp_direct_follow_arm);
++
+ int gh_hwbp_direct_disarm(pid_t tid)
+ {
+ 	struct pid *owned;
+@@ -345,6 +400,10 @@
+ 	gh_hwbp_direct.pid = NULL;
+ 	gh_hwbp_direct.pc = 0;
+ 	gh_hwbp_direct.hits = 0;
++	gh_hwbp_direct.range_start = 0;
++	gh_hwbp_direct.range_end = 0;
++	gh_hwbp_direct.limit = 0;
++	gh_hwbp_direct.follow = false;
+ 	gh_hwbp_direct.slot = -1;
+ 	gh_hwbp_direct.last_cpu = -1;
+ 	gh_hwbp_direct.stepping = false;
+@@ -392,6 +451,10 @@
+ 	gh_hwbp_direct.pid = NULL;
+ 	gh_hwbp_direct.pc = 0;
+ 	gh_hwbp_direct.hits = 0;
++	gh_hwbp_direct.range_start = 0;
++	gh_hwbp_direct.range_end = 0;
++	gh_hwbp_direct.limit = 0;
++	gh_hwbp_direct.follow = false;
+ 	gh_hwbp_direct.slot = -1;
+ 	gh_hwbp_direct.last_cpu = -1;
+ 	gh_hwbp_direct.stepping = false;

@@ -39,7 +39,8 @@ for patch in \
     "$self_dir/0017-ghosthook-scalar-write-and-ss-fastforward.patch" \
     "$self_dir/0018-ghosthook-commit-emitted-ghost-writes.patch" \
     "$self_dir/0019-ghosthook-disarm-final-ss-in-exception.patch" \
-    "$self_dir/0020-ghosthook-drain-final-owned-hwss.patch"; do
+    "$self_dir/0020-ghosthook-drain-final-owned-hwss.patch" \
+    "$self_dir/0021-ghosthook-add-bpr-follow-range-trace.patch"; do
     [ -f "$patch" ] || { echo "missing patch: $patch" >&2; exit 5; }
     git -C "$common" apply --check "$patch"
     git -C "$common" apply "$patch"
@@ -71,6 +72,9 @@ grep -q 'user_fastforward_single_step(current)' "$common/arch/arm64/kernel/gh_ss
 grep -q 'WRITE_ONCE(.*page_address(region->pages\[page\])' "$common/mm/gh_ghost.c"
 # r21 drains the hardware tail event; the public trace still ends at the requested limit.
 grep -q 'final_drain' "$common/arch/arm64/kernel/gh_ss_trace.c"
+grep -q 'gh_hwbp_direct_follow_arm' "$common/arch/arm64/kernel/hw_breakpoint.c"
+grep -q 'gh_hwbp_direct_follow_arm' "$common/include/linux/ghosthook.h"
+grep -q 'range_start' "$common/arch/arm64/kernel/hw_breakpoint.c"
 grep -q 'user_disable_single_step(current)' "$common/arch/arm64/kernel/gh_ss_trace.c"
 grep -q 'GH_GHOST_MAX_REGIONS_PER_MM' "$common/mm/gh_ghost.c"
 grep -q 'VM_MAYWRITE | VM_SHARED' "$common/mm/gh_ghost.c"

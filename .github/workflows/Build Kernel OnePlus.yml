@@ -559,6 +559,9 @@ jobs:
               "$GH_PATCH_BASE/0020-ghosthook-drain-final-owned-hwss.patch" \
               -o "$GH_PATCH_DIR/0020-ghosthook-drain-final-owned-hwss.patch"
             curl --fail --location --silent --show-error \
+              "$GH_PATCH_BASE/0021-ghosthook-add-bpr-follow-range-trace.patch" \
+              -o "$GH_PATCH_DIR/0021-ghosthook-add-bpr-follow-range-trace.patch"
+            curl --fail --location --silent --show-error \
               "$GH_PATCH_BASE/apply_explicit_router.sh" \
               -o "$GH_PATCH_DIR/apply_explicit_router.sh"
             chmod 0755 "$GH_PATCH_DIR/apply_explicit_router.sh"
