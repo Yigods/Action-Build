@@ -40,7 +40,8 @@ for patch in \
     "$self_dir/0018-ghosthook-commit-emitted-ghost-writes.patch" \
     "$self_dir/0019-ghosthook-disarm-final-ss-in-exception.patch" \
     "$self_dir/0020-ghosthook-drain-final-owned-hwss.patch" \
-    "$self_dir/0021-ghosthook-add-bpr-follow-range-trace.patch"; do
+    "$self_dir/0021-ghosthook-add-bpr-follow-range-trace.patch" \
+    "$self_dir/0022-ghosthook-add-bounded-ghcp-syscall-router.patch"; do
     [ -f "$patch" ] || { echo "missing patch: $patch" >&2; exit 5; }
     git -C "$common" apply --check "$patch"
     git -C "$common" apply "$patch"
@@ -83,5 +84,9 @@ grep -q 'gh_ghost_region_mm_exit' "$common/mm/mmap.c"
 grep -q 'gh_undef_trace_record_el0' "$common/arch/arm64/kernel/traps.c"
 grep -q 'gh_undef_trace_arm' "$common/arch/arm64/kernel/gh_undef_trace.c"
 grep -q 'gh_undef_trace_read' "$common/arch/arm64/kernel/gh_undef_trace.c"
+grep -q 'gh_control_register' "$common/kernel/gh_control.c"
+grep -q 'SYSCALL_DEFINE2(ghosthook_control' "$common/kernel/gh_control.c"
+grep -q '__NR_ghosthook_control 451' "$common/include/uapi/asm-generic/unistd.h"
+grep -q '__ARCH_WANT_GHOSTHOOK_CONTROL' "$common/arch/arm64/include/uapi/asm/unistd.h"
 test -f "$common/include/linux/ghosthook.h"
 printf 'GhostHook explicit router stack applied to %s\n' "$actual"

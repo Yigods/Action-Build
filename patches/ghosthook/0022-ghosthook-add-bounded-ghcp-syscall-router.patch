@@ -1,0 +1,226 @@
+diff --git a/arch/arm64/include/uapi/asm/unistd.h b/arch/arm64/include/uapi/asm/unistd.h
+index ce2ee8f1e361..0707aa905874 100644
+--- a/arch/arm64/include/uapi/asm/unistd.h
++++ b/arch/arm64/include/uapi/asm/unistd.h
+@@ -21,5 +21,7 @@
+ #define __ARCH_WANT_TIME32_SYSCALLS
+ #define __ARCH_WANT_SYS_CLONE3
+ #define __ARCH_WANT_MEMFD_SECRET
++/* Private, fixture-only GHCP v1 bridge; it is intentionally arm64-native. */
++#define __ARCH_WANT_GHOSTHOOK_CONTROL
+ 
+ #include <asm-generic/unistd.h>
+diff --git a/include/linux/ghosthook.h b/include/linux/ghosthook.h
+index e2bd5edb43cd..f1be31fecbc8 100644
+--- a/include/linux/ghosthook.h
++++ b/include/linux/ghosthook.h
+@@ -8,6 +8,37 @@ struct pt_regs;
+ struct task_struct;
+ struct mm_struct;
+ 
++/* GHCP v1 is the only bounded EL0->EL1 control-frame accepted by the optional
++ * native arm64 bridge.  Pointers are never part of the frame payload. */
++#define GH_CONTROL_MAGIC 0x47484350U
++#define GH_CONTROL_ABI_V1 1U
++#define GH_CONTROL_MAX_PAYLOAD 256U
++#define GH_CONTROL_SESSION_KEY_LEN 32U
++#define GH_CONTROL_FRAME_MAX \
++	(sizeof(struct gh_control_header_v1) + GH_CONTROL_MAX_PAYLOAD)
++enum gh_control_command {
++	GH_CONTROL_HELLO = 1,
++	GH_CONTROL_CAPS = 2,
++	GH_CONTROL_TRACE_RANGE_START = 3,
++	GH_CONTROL_TRACE_STATUS = 4,
++	GH_CONTROL_TRACE_DRAIN = 5,
++	GH_CONTROL_TRACE_STOP = 6,
++};
++struct gh_control_header_v1 {
++	u32 magic;
++	u16 abi;
++	u16 command;
++	u32 flags;
++	u32 payload_len;
++	u64 session_id;
++	u64 nonce;
++	u8 session_key[GH_CONTROL_SESSION_KEY_LEN];
++};
++typedef long (*gh_control_handler_t)(const void *frame, size_t frame_len,
++				     void *context);
++int gh_control_register(gh_control_handler_t handler, void *context);
++int gh_control_unregister(gh_control_handler_t handler, void *context);
++
+ /* r13 VMA-less region API. A region is one bounded, owner-mm allocation that
+  * transitions RW -> RX exactly once; callers must quiesce user execution
+  * before destroy. */
+diff --git a/include/uapi/asm-generic/unistd.h b/include/uapi/asm-generic/unistd.h
+index 28973a89cdc7..5d953769e7d6 100644
+--- a/include/uapi/asm-generic/unistd.h
++++ b/include/uapi/asm-generic/unistd.h
+@@ -886,8 +886,14 @@ __SYSCALL(__NR_futex_waitv, sys_futex_waitv)
+ #define __NR_set_mempolicy_home_node 450
+ __SYSCALL(__NR_set_mempolicy_home_node, sys_set_mempolicy_home_node)
+ 
++#ifdef __ARCH_WANT_GHOSTHOOK_CONTROL
++#define __NR_ghosthook_control 451
++__SYSCALL(__NR_ghosthook_control, sys_ghosthook_control)
++#define __NR_syscalls 452
++#else
+ #undef __NR_syscalls
+ #define __NR_syscalls 451
++#endif
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff --git a/kernel/Makefile b/kernel/Makefile
+index d070a315019e..012b8b52ca90 100644
+--- a/kernel/Makefile
++++ b/kernel/Makefile
+@@ -7,6 +7,7 @@ obj-y     = fork.o exec_domain.o panic.o \
+ 	    cpu.o exit.o softirq.o resource.o \
+ 	    sysctl.o capability.o ptrace.o user.o \
+ 	    signal.o sys.o umh.o workqueue.o pid.o task_work.o \
++	    gh_control.o \
+ 	    extable.o params.o \
+ 	    kthread.o sys_ni.o nsproxy.o \
+ 	    notifier.o ksysfs.o cred.o reboot.o \
+diff --git a/kernel/gh_control.c b/kernel/gh_control.c
+new file mode 100644
+index 000000000000..0ae021a68ae6
+--- /dev/null
++++ b/kernel/gh_control.c
+@@ -0,0 +1,135 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * Bounded, arm64-private GHCP control bridge.
++ *
++ * The syscall is only a transport gate: it copies one small frame before
++ * dispatch and holds the registration mutex while a registered KPM handler
++ * runs.  Handlers therefore execute in normal syscall process context and
++ * must not unregister themselves from inside the callback.
++ */
++#include <linux/build_bug.h>
++#include <linux/errno.h>
++#include <linux/export.h>
++#include <linux/ghosthook.h>
++#include <linux/mutex.h>
++#include <linux/string.h>
++#include <linux/syscalls.h>
++#include <linux/uaccess.h>
++
++struct gh_control_binding {
++	gh_control_handler_t handler;
++	void *context;
++};
++
++static_assert(sizeof(struct gh_control_header_v1) == 64U);
++
++static DEFINE_MUTEX(gh_control_lock);
++static struct gh_control_binding gh_control_binding;
++
++static bool gh_control_command_known(u16 command)
++{
++	return command >= GH_CONTROL_HELLO && command <= GH_CONTROL_TRACE_STOP;
++}
++
++static bool gh_control_session_key_present(const u8 *key)
++{
++	unsigned int i;
++
++	for (i = 0; i < GH_CONTROL_SESSION_KEY_LEN; ++i) {
++		if (key[i])
++			return true;
++	}
++	return false;
++}
++
++static int gh_control_validate(const void *frame, size_t frame_len,
++			       struct gh_control_header_v1 *out)
++{
++	struct gh_control_header_v1 header;
++	size_t expected;
++
++	if (frame_len < sizeof(header))
++		return -EMSGSIZE;
++	memcpy(&header, frame, sizeof(header));
++	if (header.magic != GH_CONTROL_MAGIC || header.abi != GH_CONTROL_ABI_V1)
++		return -EPROTO;
++	if (!gh_control_command_known(header.command))
++		return -EOPNOTSUPP;
++	if (header.flags)
++		return -EINVAL;
++	if (header.payload_len > GH_CONTROL_MAX_PAYLOAD)
++		return -EMSGSIZE;
++	expected = sizeof(header) + (size_t)header.payload_len;
++	if (expected != frame_len)
++		return -EMSGSIZE;
++	if (header.command != GH_CONTROL_HELLO && header.command != GH_CONTROL_CAPS &&
++	    (!header.session_id || !gh_control_session_key_present(header.session_key)))
++		return -EACCES;
++	if (out)
++		*out = header;
++	return 0;
++}
++
++int gh_control_register(gh_control_handler_t handler, void *context)
++{
++	int ret = 0;
++
++	if (!handler)
++		return -EINVAL;
++	mutex_lock(&gh_control_lock);
++	if (gh_control_binding.handler)
++		ret = -EBUSY;
++	else {
++		gh_control_binding.context = context;
++		gh_control_binding.handler = handler;
++	}
++	mutex_unlock(&gh_control_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(gh_control_register);
++
++int gh_control_unregister(gh_control_handler_t handler, void *context)
++{
++	int ret = 0;
++
++	if (!handler)
++		return -EINVAL;
++	mutex_lock(&gh_control_lock);
++	if (gh_control_binding.handler != handler ||
++	    gh_control_binding.context != context)
++		ret = -ENOENT;
++	else {
++		gh_control_binding.handler = NULL;
++		gh_control_binding.context = NULL;
++	}
++	mutex_unlock(&gh_control_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(gh_control_unregister);
++
++SYSCALL_DEFINE2(ghosthook_control, const void __user *, frame, size_t, frame_len)
++{
++	u8 local[GH_CONTROL_FRAME_MAX];
++	gh_control_handler_t handler;
++	void *context;
++	int ret;
++
++	if (!frame || frame_len < sizeof(struct gh_control_header_v1) ||
++	    frame_len > sizeof(local))
++		return -EMSGSIZE;
++	if (copy_from_user(local, frame, frame_len))
++		return -EFAULT;
++	ret = gh_control_validate(local, frame_len, NULL);
++	if (ret)
++		return ret;
++	/* Serializing dispatch with unregister pins KPM text for this invocation. */
++	mutex_lock(&gh_control_lock);
++	handler = gh_control_binding.handler;
++	context = gh_control_binding.context;
++	if (!handler)
++		ret = -ENODEV;
++	else
++		ret = handler(local, frame_len, context);
++	mutex_unlock(&gh_control_lock);
++	return ret;
++}
