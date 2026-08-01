@@ -19,6 +19,16 @@ git -C "$common" diff --quiet || {
     echo "refusing: common worktree is dirty" >&2
     exit 4
 }
+
+require_pattern() {
+    pattern=$1
+    file=$2
+    grep -q -- "$pattern" "$file" || {
+        echo "missing post-apply invariant: $pattern ($file)" >&2
+        exit 6
+    }
+}
+
 for patch in \
     "$self_dir/0001-ghosthook-add-explicit-fault-router-point.patch" \
     "$self_dir/0002-ghosthook-add-explicit-debug-router-point.patch" \
@@ -48,49 +58,49 @@ for patch in \
     git -C "$common" apply "$patch"
 done
 git -C "$common" diff --check
-grep -q 'gh_fault_router_register' "$common/arch/arm64/mm/fault.c"
-grep -q 'gh_fault_router_unregister' "$common/arch/arm64/mm/fault.c"
-grep -q 'gh_debug_router_register' "$common/arch/arm64/mm/fault.c"
-grep -q 'gh_debug_router_unregister' "$common/arch/arm64/mm/fault.c"
-grep -q 'gh_debug_router_register_core' "$common/arch/arm64/mm/fault.c"
-grep -q 'gh_hwbp_direct_arm' "$common/arch/arm64/kernel/hw_breakpoint.c"
-grep -q 'gh_hwbp_direct_disarm' "$common/arch/arm64/kernel/hw_breakpoint.c"
-grep -q 'gh_hwbp_direct_read_trace' "$common/arch/arm64/kernel/hw_breakpoint.c"
-grep -q 'ss_conflicted' "$common/arch/arm64/kernel/hw_breakpoint.c"
-grep -q 'gh_hwbp_direct_task_exit' "$common/kernel/exit.c"
-grep -q 'GH_DEBUG_ROUTER_CORE_MAX 2' "$common/arch/arm64/mm/fault.c"
-grep -q 'gh_ss_trace_arm' "$common/arch/arm64/kernel/gh_ss_trace.c"
-grep -q 'gh_ss_trace_arm_work' "$common/arch/arm64/kernel/gh_ss_trace.c"
-grep -q 'user_rewind_single_step(current)' "$common/arch/arm64/kernel/gh_ss_trace.c"
+require_pattern 'gh_fault_router_register' "$common/arch/arm64/mm/fault.c"
+require_pattern 'gh_fault_router_unregister' "$common/arch/arm64/mm/fault.c"
+require_pattern 'gh_debug_router_register' "$common/arch/arm64/mm/fault.c"
+require_pattern 'gh_debug_router_unregister' "$common/arch/arm64/mm/fault.c"
+require_pattern 'gh_debug_router_register_core' "$common/arch/arm64/mm/fault.c"
+require_pattern 'gh_hwbp_direct_arm' "$common/arch/arm64/kernel/hw_breakpoint.c"
+require_pattern 'gh_hwbp_direct_disarm' "$common/arch/arm64/kernel/hw_breakpoint.c"
+require_pattern 'gh_hwbp_direct_read_trace' "$common/arch/arm64/kernel/hw_breakpoint.c"
+require_pattern 'ss_conflicted' "$common/arch/arm64/kernel/hw_breakpoint.c"
+require_pattern 'gh_hwbp_direct_task_exit' "$common/kernel/exit.c"
+require_pattern 'GH_DEBUG_ROUTER_CORE_MAX 2' "$common/arch/arm64/mm/fault.c"
+require_pattern 'gh_ss_trace_arm' "$common/arch/arm64/kernel/gh_ss_trace.c"
+require_pattern 'gh_ss_trace_arm_work' "$common/arch/arm64/kernel/gh_ss_trace.c"
+require_pattern 'user_rewind_single_step(current)' "$common/arch/arm64/kernel/gh_ss_trace.c"
 # Explicit stop still uses task_work for a remote target; the final owned
 # HWSS is intentionally disarmed directly in its exception context.
-grep -q 'task_work_add(task, &gh_ss_trace.disarm_work, TWA_RESUME)' "$common/arch/arm64/kernel/gh_ss_trace.c"
-grep -q 'task_work_add' "$common/arch/arm64/kernel/gh_ss_trace.c"
-grep -q 'gh_ss_trace_register_router' "$common/arch/arm64/kernel/hw_breakpoint.c"
-grep -q 'gh_ghost_region_create' "$common/mm/gh_ghost.c"
-grep -q 'gh_ghost_region_write_u32' "$common/mm/gh_ghost.c"
-grep -q 'gh_ghost_region_write_u32' "$common/include/linux/ghosthook.h"
-grep -q 'user_fastforward_single_step(current)' "$common/arch/arm64/kernel/gh_ss_trace.c"
-grep -q 'WRITE_ONCE(.*page_address(region->pages\[page\])' "$common/mm/gh_ghost.c"
+require_pattern 'task_work_add(task, &gh_ss_trace.disarm_work, TWA_RESUME)' "$common/arch/arm64/kernel/gh_ss_trace.c"
+require_pattern 'task_work_add' "$common/arch/arm64/kernel/gh_ss_trace.c"
+require_pattern 'gh_ss_trace_register_router' "$common/arch/arm64/kernel/hw_breakpoint.c"
+require_pattern 'gh_ghost_region_create' "$common/mm/gh_ghost.c"
+require_pattern 'gh_ghost_region_write_u32' "$common/mm/gh_ghost.c"
+require_pattern 'gh_ghost_region_write_u32' "$common/include/linux/ghosthook.h"
+require_pattern 'user_fastforward_single_step(current)' "$common/arch/arm64/kernel/gh_ss_trace.c"
+require_pattern 'WRITE_ONCE(.*page_address(region->pages\[page\])' "$common/mm/gh_ghost.c"
 # r21 drains the hardware tail event; the public trace still ends at the requested limit.
-grep -q 'final_drain' "$common/arch/arm64/kernel/gh_ss_trace.c"
-grep -q 'gh_hwbp_direct_follow_arm' "$common/arch/arm64/kernel/hw_breakpoint.c"
-grep -q 'gh_hwbp_direct_follow_arm' "$common/include/linux/ghosthook.h"
-grep -q 'range_start' "$common/arch/arm64/kernel/hw_breakpoint.c"
-grep -q 'user_disable_single_step(current)' "$common/arch/arm64/kernel/gh_ss_trace.c"
-grep -q 'GH_GHOST_MAX_REGIONS_PER_MM' "$common/mm/gh_ghost.c"
-grep -q 'VM_MAYWRITE | VM_SHARED' "$common/mm/gh_ghost.c"
-grep -q 'gh_ghost_region_overlaps' "$common/mm/mmap.c"
-grep -q 'gh_ghost_region_mm_exit' "$common/mm/mmap.c"
-grep -q 'gh_undef_trace_record_el0' "$common/arch/arm64/kernel/traps.c"
-grep -q 'gh_undef_trace_arm' "$common/arch/arm64/kernel/gh_undef_trace.c"
-grep -q 'gh_undef_trace_read' "$common/arch/arm64/kernel/gh_undef_trace.c"
-grep -q 'gh_control_register' "$common/kernel/gh_control.c"
-grep -q 'SYSCALL_DEFINE2(ghosthook_control' "$common/kernel/gh_control.c"
-grep -q '__NR_ghosthook_control 451' "$common/include/uapi/asm-generic/unistd.h"
-grep -q '__ARCH_WANT_GHOSTHOOK_CONTROL' "$common/arch/arm64/include/uapi/asm/unistd.h"
-grep -q 'gh_control_register_v2' "$common/kernel/gh_control.c"
-grep -q 'SYSCALL_DEFINE4(ghosthook_control' "$common/kernel/gh_control.c"
-grep -q 'GH_CONTROL_V2_RESPONSE_MAX 4096U' "$common/include/linux/ghosthook.h"
+require_pattern 'final_drain' "$common/arch/arm64/kernel/gh_ss_trace.c"
+require_pattern 'gh_hwbp_direct_follow_arm' "$common/arch/arm64/kernel/hw_breakpoint.c"
+require_pattern 'gh_hwbp_direct_follow_arm' "$common/include/linux/ghosthook.h"
+require_pattern 'range_start' "$common/arch/arm64/kernel/hw_breakpoint.c"
+require_pattern 'user_disable_single_step(current)' "$common/arch/arm64/kernel/gh_ss_trace.c"
+require_pattern 'GH_GHOST_MAX_REGIONS_PER_MM' "$common/mm/gh_ghost.c"
+require_pattern 'VM_MAYWRITE | VM_SHARED' "$common/mm/gh_ghost.c"
+require_pattern 'gh_ghost_region_overlaps' "$common/mm/mmap.c"
+require_pattern 'gh_ghost_region_mm_exit' "$common/mm/mmap.c"
+require_pattern 'gh_undef_trace_record_el0' "$common/arch/arm64/kernel/traps.c"
+require_pattern 'gh_undef_trace_arm' "$common/arch/arm64/kernel/gh_undef_trace.c"
+require_pattern 'gh_undef_trace_read' "$common/arch/arm64/kernel/gh_undef_trace.c"
+require_pattern 'gh_control_register' "$common/kernel/gh_control.c"
+require_pattern 'gh_control_dispatch_v1' "$common/kernel/gh_control.c"
+require_pattern '__NR_ghosthook_control 451' "$common/include/uapi/asm-generic/unistd.h"
+require_pattern '__ARCH_WANT_GHOSTHOOK_CONTROL' "$common/arch/arm64/include/uapi/asm/unistd.h"
+require_pattern 'gh_control_register_v2' "$common/kernel/gh_control.c"
+require_pattern 'SYSCALL_DEFINE4(ghosthook_control' "$common/kernel/gh_control.c"
+require_pattern 'GH_CONTROL_V2_RESPONSE_MAX 4096U' "$common/include/linux/ghosthook.h"
 test -f "$common/include/linux/ghosthook.h"
 printf 'GhostHook explicit router stack applied to %s\n' "$actual"
