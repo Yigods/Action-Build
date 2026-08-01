@@ -1,0 +1,84 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: no_trace <noreply@example.invalid>
+Date: Sat, 1 Aug 2026 15:00:00 +0800
+Subject: [PATCH] ghosthook: add scalar ghost writer and fast-forward SS teardown
+
+KPM writable/stack-backed source buffers are not a safe transport for emitted
+Ghost code on the target KPM ABI: a runtime probe observed zero or stale words
+in the sealed VMA-less PTE despite a successful pointer-based write call. Add
+a bounded u32 writer whose value is carried in registers; KPM code emitters can
+therefore populate a Ghost region without exposing a mutable module pointer to
+the core copy path.
+
+Also fast-forward the saved EL0 single-step state before clearing
+TIF_SINGLESTEP in deferred task work. This prevents the final consumed bounded
+SS event from surfacing as a stock SIGTRAP on return to EL0.
+
+---
+ arch/arm64/kernel/gh_ss_trace.c |  3 +++
+ include/linux/ghosthook.h       |  4 ++++
+ mm/gh_ghost.c                   | 28 ++++++++++++++++++++++++++++
+ 3 files changed, 35 insertions(+)
+
+--- a/arch/arm64/kernel/gh_ss_trace.c
++++ b/arch/arm64/kernel/gh_ss_trace.c
+@@ -115,6 +115,9 @@
+ 	unsigned long flags;
+ 
+ 	(void)work;
++	/* Clear the saved EL0 SS bit before dropping TIF_SINGLESTEP.  Otherwise
++	 * return-to-user can surface one unowned HWSS as SIGTRAP. */
++	user_fastforward_single_step(current);
+ 	user_disable_single_step(current);
+ 	raw_spin_lock_irqsave(&gh_ss_trace_lock, flags);
+ 	gh_ss_trace.disarm_work_pending = false;
+--- a/include/linux/ghosthook.h
++++ b/include/linux/ghosthook.h
+@@ -25,6 +25,10 @@
+ 			   unsigned long length, unsigned long flags, u64 *handle_out);
+ int gh_ghost_region_write(struct mm_struct *mm, u64 handle,
+ 			  unsigned long offset, const void *src, size_t len);
++/* Scalar writer for KPM-generated instruction streams.  The value is passed
++ * in registers, avoiding a transient writable KPM source mapping. */
++int gh_ghost_region_write_u32(struct mm_struct *mm, u64 handle,
++			      unsigned long offset, u32 value);
+ int gh_ghost_region_seal_rx(struct mm_struct *mm, u64 handle);
+ int gh_ghost_region_destroy(struct mm_struct *mm, u64 handle);
+ int gh_ghost_region_query(struct mm_struct *mm, unsigned long addr,
+--- a/mm/gh_ghost.c
++++ b/mm/gh_ghost.c
+@@ -275,6 +275,34 @@
+ }
+ EXPORT_SYMBOL_GPL(gh_ghost_region_write);
+ 
++int gh_ghost_region_write_u32(struct mm_struct *mm, u64 handle,
++			      unsigned long offset, u32 value)
++{
++	struct gh_ghost_region *region;
++	unsigned long page;
++	unsigned long page_offset;
++	int ret = 0;
++
++	if (!mm || (offset & (sizeof(value) - 1U)) ||
++	    offset > ULONG_MAX - sizeof(value))
++		return -EINVAL;
++	mutex_lock(&gh_ghost_lock);
++	region = gh_ghost_find_handle_locked(mm, handle);
++	if (!region || region->state != GH_GHOST_STATE_RW ||
++	    offset + sizeof(value) > region->length) {
++		ret = -EINVAL;
++		goto out;
++	}
++	page = offset >> PAGE_SHIFT;
++	page_offset = offset & ~PAGE_MASK;
++	memcpy((u8 *)page_address(region->pages[page]) + page_offset,
++	       &value, sizeof(value));
++out:
++	mutex_unlock(&gh_ghost_lock);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(gh_ghost_region_write_u32);
++
+ int gh_ghost_region_seal_rx(struct mm_struct *mm, u64 handle)
+ {
+ 	struct gh_ghost_region *region;

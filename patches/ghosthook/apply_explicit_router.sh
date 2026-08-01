@@ -35,7 +35,8 @@ for patch in \
     "$self_dir/0013-ghosthook-allow-bounded-code-data-pair.patch" \
     "$self_dir/0014-ghosthook-make-rw-data-pte-writable.patch" \
     "$self_dir/0015-ghosthook-rewind-ss-after-consumed-event.patch" \
-    "$self_dir/0016-ghosthook-clear-pending-ss-on-stop.patch"; do
+    "$self_dir/0016-ghosthook-clear-pending-ss-on-stop.patch" \
+    "$self_dir/0017-ghosthook-scalar-write-and-ss-fastforward.patch"; do
     [ -f "$patch" ] || { echo "missing patch: $patch" >&2; exit 5; }
     git -C "$common" apply --check "$patch"
     git -C "$common" apply "$patch"
@@ -59,6 +60,9 @@ grep -q 'task_work_add(current, &gh_ss_trace.disarm_work, TWA_RESUME)' "$common/
 grep -q 'task_work_add' "$common/arch/arm64/kernel/gh_ss_trace.c"
 grep -q 'gh_ss_trace_register_router' "$common/arch/arm64/kernel/hw_breakpoint.c"
 grep -q 'gh_ghost_region_create' "$common/mm/gh_ghost.c"
+grep -q 'gh_ghost_region_write_u32' "$common/mm/gh_ghost.c"
+grep -q 'gh_ghost_region_write_u32' "$common/include/linux/ghosthook.h"
+grep -q 'user_fastforward_single_step(current)' "$common/arch/arm64/kernel/gh_ss_trace.c"
 grep -q 'GH_GHOST_MAX_REGIONS_PER_MM' "$common/mm/gh_ghost.c"
 grep -q 'VM_MAYWRITE | VM_SHARED' "$common/mm/gh_ghost.c"
 grep -q 'gh_ghost_region_overlaps' "$common/mm/mmap.c"
