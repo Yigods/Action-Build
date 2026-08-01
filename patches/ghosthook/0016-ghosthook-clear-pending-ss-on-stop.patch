@@ -1,39 +1,60 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: no_trace <noreply@example.invalid>
-Date: Sat, 1 Aug 2026 11:10:00 +0800
-Subject: [PATCH] ghosthook: clear pending EL0 SS at bounded trace stop
+Date: Sat, 1 Aug 2026 12:00:00 +0800
+Subject: [PATCH] ghosthook: defer bounded SS teardown to task return
 
-A bounded trace consumes its final HWSS exception before Linux reaches
-single_step_handler().  user_disable_single_step() clears TIF_SINGLESTEP but
-intentionally does not change the current exception frame's SPSR.SS bit.
-Returning to EL0 with that pending bit set produces one unowned HWSS event,
-which falls through to the stock handler and delivers SIGTRAP to the target.
+The bounded SS trace consumes its own HWSS exception before Linux reaches
+single_step_handler().  Tearing down the target's single-step state directly
+from that exception frame leaves the EL0 transition vulnerable to an unowned
+follow-up HWSS, which the stock handler turns into SIGTRAP.
 
-Use user_fastforward_single_step() while the session still owns
-TIF_SINGLESTEP, then disable it.  This clears the task's pending EL0 SS state
-through the architecture's public API.  Active (non-final) events retain the
-prior rewind behavior.
+At the final recorded event, keep the state transition bounded but queue the
+existing disarm task_work on the current target with TWA_RESUME.  That work
+runs on the normal target EL0-return path and clears TIF_SINGLESTEP there.
+The callback remains allocation-free and does not mutate a foreign task.
 
 ---
- arch/arm64/kernel/gh_ss_trace.c | 6 +++++-
- 1 file changed, 5 insertions(+), 1 deletion(-)
+ arch/arm64/kernel/gh_ss_trace.c | 12 ++++++++++--
+ 1 file changed, 10 insertions(+), 2 deletions(-)
 
 diff --git a/arch/arm64/kernel/gh_ss_trace.c b/arch/arm64/kernel/gh_ss_trace.c
 --- a/arch/arm64/kernel/gh_ss_trace.c
 +++ b/arch/arm64/kernel/gh_ss_trace.c
-@@ -138,7 +138,12 @@
+@@ -126,6 +126,7 @@
+ {
+ 	unsigned long flags;
+ 	bool consumed = false;
++	bool queue_disarm = false;
+ 
+ 	(void)addr_if_watchpoint;
+ 	(void)context;
+@@ -138,10 +139,12 @@
  	gh_ss_trace_record_locked(regs);
  	gh_ss_trace.hits++;
  	if (gh_ss_trace.hits >= gh_ss_trace.limit) {
 -		/* The bounded session owns this SS request and may clear it. */
-+		/*
-+		 * user_disable_single_step() clears TIF_SINGLESTEP only.  Clear
-+		 * the pending SPSR.SS bit in this exception frame as well, or the
-+		 * EL0 return takes one unowned HWSS trap and receives SIGTRAP.
-+		 */
-+		user_fastforward_single_step(current);
- 		user_disable_single_step(current);
+-		user_disable_single_step(current);
++		/* Defer SS teardown to this task's EL0-return task_work. */
++		init_task_work(&gh_ss_trace.disarm_work, gh_ss_trace_disarm_work);
++		gh_ss_trace.disarm_work_pending = true;
  		gh_ss_trace.ss_owned = false;
  		gh_ss_trace.active = false;
++		queue_disarm = true;
+ 	} else {
+ 		/* We consumed HWSS before stock single_step_handler's rewind. */
+ 		user_rewind_single_step(current);
+@@ -149,6 +152,12 @@
+ 	consumed = true;
+ out:
+ 	raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
++	if (queue_disarm &&
++	    task_work_add(current, &gh_ss_trace.disarm_work, TWA_RESUME)) {
++		raw_spin_lock_irqsave(&gh_ss_trace_lock, flags);
++		gh_ss_trace.disarm_work_pending = false;
++		raw_spin_unlock_irqrestore(&gh_ss_trace_lock, flags);
++	}
+ 	return consumed;
+ }
+ 
 -- 
 2.43.0
