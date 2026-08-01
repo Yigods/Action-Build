@@ -30,7 +30,7 @@ diff --git a/arch/arm64/kernel/gh_ss_trace.c b/arch/arm64/kernel/gh_ss_trace.c
 +		 * EL0 return takes one unowned HWSS trap and receives SIGTRAP.
 +		 */
  		user_disable_single_step(current);
-+		clear_regs_spsr_ss(regs);
++		regs->pstate &= ~DBG_SPSR_SS;
  		gh_ss_trace.ss_owned = false;
  		gh_ss_trace.active = false;
  	} else {
