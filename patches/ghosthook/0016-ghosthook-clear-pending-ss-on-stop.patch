@@ -9,17 +9,19 @@ intentionally does not change the current exception frame's SPSR.SS bit.
 Returning to EL0 with that pending bit set produces one unowned HWSS event,
 which falls through to the stock handler and delivers SIGTRAP to the target.
 
-Clear SPSR.SS in the consumed final exception frame after relinquishing
-TIF_SINGLESTEP.  Active (non-final) events retain the prior rewind behavior.
+Use user_fastforward_single_step() while the session still owns
+TIF_SINGLESTEP, then disable it.  This clears the task's pending EL0 SS state
+through the architecture's public API.  Active (non-final) events retain the
+prior rewind behavior.
 
 ---
- arch/arm64/kernel/gh_ss_trace.c | 8 +++++++-
- 1 file changed, 7 insertions(+), 1 deletion(-)
+ arch/arm64/kernel/gh_ss_trace.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
 
 diff --git a/arch/arm64/kernel/gh_ss_trace.c b/arch/arm64/kernel/gh_ss_trace.c
 --- a/arch/arm64/kernel/gh_ss_trace.c
 +++ b/arch/arm64/kernel/gh_ss_trace.c
-@@ -138,8 +138,13 @@
+@@ -138,7 +138,12 @@
  	gh_ss_trace_record_locked(regs);
  	gh_ss_trace.hits++;
  	if (gh_ss_trace.hits >= gh_ss_trace.limit) {
@@ -29,10 +31,9 @@ diff --git a/arch/arm64/kernel/gh_ss_trace.c b/arch/arm64/kernel/gh_ss_trace.c
 +		 * the pending SPSR.SS bit in this exception frame as well, or the
 +		 * EL0 return takes one unowned HWSS trap and receives SIGTRAP.
 +		 */
- 		user_disable_single_step(current);
 +		user_fastforward_single_step(current);
+ 		user_disable_single_step(current);
  		gh_ss_trace.ss_owned = false;
  		gh_ss_trace.active = false;
- 	} else {
 -- 
 2.43.0
