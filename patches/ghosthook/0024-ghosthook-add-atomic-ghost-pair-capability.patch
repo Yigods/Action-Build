@@ -1,0 +1,425 @@
+diff --git a/include/linux/ghosthook.h b/include/linux/ghosthook.h
+index dc400c8..44141d9 100644
+--- a/include/linux/ghosthook.h
++++ b/include/linux/ghosthook.h
+@@ -50,6 +50,7 @@ int gh_control_unregister(gh_control_handler_t handler, void *context);
+ #define GH_CONTROL_V2_RESPONSE_MAX 4096U
+ #define GH_CONTROL_V2_RESPONSE_FLAG 1U
+ #define GH_CONTROL_SESSION_CLOSE 7U
++#define GH_CONTROL_CAPABILITY_CALL 8U
+ struct gh_control_response_v2 {
+ 	u32 magic;
+ 	u16 abi;
+@@ -92,6 +93,14 @@ struct gh_ghost_region_info {
+ };
+ int gh_ghost_region_create(struct mm_struct *mm, unsigned long user_addr,
+ 			   unsigned long length, unsigned long flags, u64 *handle_out);
++/* Allocate one contiguous current-mm code/data pair under a single mmap and
++ * registry transaction. Both regions start RW; callers seal only code. */
++int gh_ghost_region_create_pair_auto(struct mm_struct *mm,
++				     unsigned long code_length,
++				     unsigned long data_length,
++				     unsigned long *base_out,
++				     u64 *code_handle_out,
++				     u64 *data_handle_out);
+ int gh_ghost_region_write(struct mm_struct *mm, u64 handle,
+ 			  unsigned long offset, const void *src, size_t len);
+ /* Scalar writer for KPM-generated instruction streams.  The value is passed
+@@ -100,6 +109,8 @@ int gh_ghost_region_write_u32(struct mm_struct *mm, u64 handle,
+ 			      unsigned long offset, u32 value);
+ int gh_ghost_region_seal_rx(struct mm_struct *mm, u64 handle);
+ int gh_ghost_region_destroy(struct mm_struct *mm, u64 handle);
++int gh_ghost_region_destroy_pair(struct mm_struct *mm, u64 code_handle,
++				 u64 data_handle);
+ int gh_ghost_region_query(struct mm_struct *mm, unsigned long addr,
+ 			  struct gh_ghost_region_info *out);
+ /* VM internals call these while mmap_write_lock(mm) is held. */
+diff --git a/kernel/gh_control.c b/kernel/gh_control.c
+index 2cc6510..5d25b24 100644
+--- a/kernel/gh_control.c
++++ b/kernel/gh_control.c
+@@ -80,7 +80,7 @@ static int gh_control_validate_v2(const void *frame, size_t frame_len,
+ 	if (header.magic != GH_CONTROL_MAGIC || header.abi != GH_CONTROL_ABI_V2)
+ 		return -EPROTO;
+ 	if (header.command < GH_CONTROL_HELLO ||
+-	    header.command > GH_CONTROL_SESSION_CLOSE)
++	    header.command > GH_CONTROL_CAPABILITY_CALL)
+ 		return -EOPNOTSUPP;
+ 	if (header.flags || !header.nonce)
+ 		return -EINVAL;
+diff --git a/mm/gh_ghost.c b/mm/gh_ghost.c
+index b055b42..6a9fb80 100644
+--- a/mm/gh_ghost.c
++++ b/mm/gh_ghost.c
+@@ -10,11 +10,13 @@
+  * for trusted per-thread state while its companion transitions once to RX.
+  */
+ #include <linux/errno.h>
++#include <linux/err.h>
+ #include <linux/ghosthook.h>
+ #include <linux/highmem.h>
+ #include <linux/list.h>
+ #include <linux/mm.h>
+ #include <linux/mutex.h>
++#include <linux/sched.h>
+ #include <linux/slab.h>
+ #include <linux/string.h>
+ #include <asm/cacheflush.h>
+@@ -38,6 +40,8 @@ enum gh_ghost_pte_op {
+ 	GH_GHOST_PTE_PROBE = 0,
+ 	GH_GHOST_PTE_INSTALL,
+ 	GH_GHOST_PTE_CLEAR,
++	GH_GHOST_PTE_ROLLBACK,
++	GH_GHOST_PTE_RESTORE,
+ };
+ 
+ struct gh_ghost_pte_txn {
+@@ -107,9 +111,28 @@ static int gh_ghost_pte_callback(pte_t *ptep, unsigned long addr, void *data)
+ 			   mk_pte(region->pages[index], txn->prot));
+ 		return 0;
+ 	case GH_GHOST_PTE_CLEAR:
+-		old = ptep_get_and_clear(region->mm, addr, ptep);
++		old = READ_ONCE(*ptep);
+ 		if (pte_none(old) || pte_pfn(old) != page_to_pfn(region->pages[index]))
+ 			return -EUCLEAN;
++		(void)ptep_get_and_clear(region->mm, addr, ptep);
++		return 0;
++	case GH_GHOST_PTE_ROLLBACK:
++		old = READ_ONCE(*ptep);
++		if (pte_none(old))
++			return 0;
++		if (pte_pfn(old) != page_to_pfn(region->pages[index]))
++			return -EUCLEAN;
++		(void)ptep_get_and_clear(region->mm, addr, ptep);
++		return 0;
++	case GH_GHOST_PTE_RESTORE:
++		old = READ_ONCE(*ptep);
++		if (!pte_none(old)) {
++			if (pte_pfn(old) != page_to_pfn(region->pages[index]))
++				return -EUCLEAN;
++			(void)ptep_get_and_clear(region->mm, addr, ptep);
++		}
++		set_pte_at(region->mm, addr, ptep,
++			   mk_pte(region->pages[index], txn->prot));
+ 		return 0;
+ 	}
+ 	return -EINVAL;
+@@ -127,6 +150,39 @@ static void gh_ghost_release_region(struct gh_ghost_region *region)
+ 	kfree(region);
+ }
+ 
++static struct gh_ghost_region *
++gh_ghost_alloc_region(struct mm_struct *mm, unsigned long length)
++{
++	struct gh_ghost_region *region;
++	unsigned long i;
++
++	if (!mm || !length || (length & ~PAGE_MASK) ||
++	    length >> PAGE_SHIFT > GH_GHOST_MAX_PAGES)
++		return ERR_PTR(-EINVAL);
++	region = kzalloc(sizeof(*region), GFP_KERNEL);
++	if (!region)
++		return ERR_PTR(-ENOMEM);
++	region->nr_pages = length >> PAGE_SHIFT;
++	region->pages = kcalloc(region->nr_pages, sizeof(*region->pages),
++				GFP_KERNEL);
++	if (!region->pages) {
++		kfree(region);
++		return ERR_PTR(-ENOMEM);
++	}
++	region->mm = mm;
++	region->length = length;
++	/* Keep mm_struct storage alive even after its last users exits. */
++	mmgrab(mm);
++	for (i = 0; i < region->nr_pages; ++i) {
++		region->pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
++		if (!region->pages[i]) {
++			gh_ghost_release_region(region);
++			return ERR_PTR(-ENOMEM);
++		}
++	}
++	return region;
++}
++
+ static int gh_ghost_clear_locked(struct gh_ghost_region *region)
+ {
+ 	struct gh_ghost_pte_txn txn = {
+@@ -142,6 +198,38 @@ static int gh_ghost_clear_locked(struct gh_ghost_region *region)
+ 	return ret;
+ }
+ 
++static int gh_ghost_rollback_locked(struct gh_ghost_region *region)
++{
++	struct gh_ghost_pte_txn txn = {
++		.region = region,
++		.op = GH_GHOST_PTE_ROLLBACK,
++	};
++	int ret;
++
++	ret = apply_to_existing_page_range(region->mm, region->start,
++					   region->length, gh_ghost_pte_callback, &txn);
++	flush_tlb_mm(region->mm);
++	return ret;
++}
++
++static int gh_ghost_restore_locked(struct gh_ghost_region *region)
++{
++	struct gh_ghost_pte_txn txn = {
++		.region = region,
++		.prot = region->state == GH_GHOST_STATE_RX ?
++			vm_get_page_prot(VM_READ | VM_EXEC | VM_MAYREAD | VM_MAYEXEC) :
++			vm_get_page_prot(VM_READ | VM_WRITE | VM_MAYREAD |
++					 VM_MAYWRITE | VM_SHARED),
++		.op = GH_GHOST_PTE_RESTORE,
++	};
++	int ret;
++
++	ret = apply_to_page_range(region->mm, region->start, region->length,
++				  gh_ghost_pte_callback, &txn);
++	flush_tlb_mm(region->mm);
++	return ret;
++}
++
+ bool gh_ghost_region_overlaps(struct mm_struct *mm, unsigned long start,
+ 				      unsigned long length)
+ {
+@@ -169,34 +257,16 @@ int gh_ghost_region_create(struct mm_struct *mm, unsigned long user_addr,
+ {
+ 	struct gh_ghost_region *region;
+ 	struct gh_ghost_pte_txn txn;
+-	unsigned long i;
+ 	int ret = 0;
+ 
+ 	if (!mm || !handle_out || !gh_ghost_range_valid(user_addr, length) ||
+ 	    flags != (GH_GHOST_F_READ | GH_GHOST_F_WRITE) ||
+ 	    length >> PAGE_SHIFT > GH_GHOST_MAX_PAGES)
+ 		return -EINVAL;
+-	region = kzalloc(sizeof(*region), GFP_KERNEL);
+-	if (!region)
+-		return -ENOMEM;
+-	region->nr_pages = length >> PAGE_SHIFT;
+-	region->pages = kcalloc(region->nr_pages, sizeof(*region->pages), GFP_KERNEL);
+-	if (!region->pages) {
+-		kfree(region);
+-		return -ENOMEM;
+-	}
+-	region->mm = mm;
+-	/* Keep mm_struct storage alive even after its last users exits. */
+-	mmgrab(mm);
+-	for (i = 0; i < region->nr_pages; ++i) {
+-		region->pages[i] = alloc_page(GFP_KERNEL | __GFP_ZERO);
+-		if (!region->pages[i]) {
+-			ret = -ENOMEM;
+-			goto fail_free;
+-		}
+-	}
++	region = gh_ghost_alloc_region(mm, length);
++	if (IS_ERR(region))
++		return PTR_ERR(region);
+ 	region->start = user_addr;
+-	region->length = length;
+ 	region->handle = atomic64_inc_return(&gh_ghost_next_handle);
+ 	region->state = GH_GHOST_STATE_RW;
+ 
+@@ -225,7 +295,7 @@ int gh_ghost_region_create(struct mm_struct *mm, unsigned long user_addr,
+ 	ret = apply_to_page_range(mm, user_addr, length,
+ 					 gh_ghost_pte_callback, &txn);
+ 	if (ret) {
+-		(void)gh_ghost_clear_locked(region);
++		(void)gh_ghost_rollback_locked(region);
+ 		goto fail_unlock;
+ 	}
+ 	flush_tlb_mm(mm);
+@@ -238,12 +308,116 @@ int gh_ghost_region_create(struct mm_struct *mm, unsigned long user_addr,
+ fail_unlock:
+ 	mutex_unlock(&gh_ghost_lock);
+ 	mmap_write_unlock(mm);
+-fail_free:
+ 	gh_ghost_release_region(region);
+ 	return ret;
+ }
+ EXPORT_SYMBOL_GPL(gh_ghost_region_create);
+ 
++int gh_ghost_region_create_pair_auto(struct mm_struct *mm,
++				     unsigned long code_length,
++				     unsigned long data_length,
++				     unsigned long *base_out,
++				     u64 *code_handle_out,
++				     u64 *data_handle_out)
++{
++	struct gh_ghost_region *code, *data;
++	struct gh_ghost_pte_txn txn;
++	unsigned long base, total;
++	int ret;
++
++	if (!mm || mm != current->mm || !base_out || !code_handle_out ||
++	    !data_handle_out || !code_length || !data_length ||
++	    (code_length & ~PAGE_MASK) || (data_length & ~PAGE_MASK) ||
++	    code_length >> PAGE_SHIFT > GH_GHOST_MAX_PAGES ||
++	    data_length >> PAGE_SHIFT > GH_GHOST_MAX_PAGES ||
++	    code_length > TASK_SIZE - data_length)
++		return -EINVAL;
++	total = code_length + data_length;
++	code = gh_ghost_alloc_region(mm, code_length);
++	if (IS_ERR(code))
++		return PTR_ERR(code);
++	data = gh_ghost_alloc_region(mm, data_length);
++	if (IS_ERR(data)) {
++		ret = PTR_ERR(data);
++		goto fail_code;
++	}
++
++	mmap_write_lock(mm);
++	mutex_lock(&gh_ghost_lock);
++	/* A pair is one indivisible owner allocation.  Do not fill a single
++	 * remaining slot or combine it with a legacy region. */
++	if (gh_ghost_mm_region_count_locked(mm)) {
++		ret = -EBUSY;
++		goto fail_unlock;
++	}
++	base = get_unmapped_area(NULL, 0, total, 0, 0);
++	if (IS_ERR_VALUE(base)) {
++		ret = (long)base;
++		goto fail_unlock;
++	}
++	if (!gh_ghost_range_valid(base, total) ||
++	    find_vma_intersection(mm, base, base + total)) {
++		ret = -EBUSY;
++		goto fail_unlock;
++	}
++	code->start = base;
++	code->handle = atomic64_inc_return(&gh_ghost_next_handle);
++	code->state = GH_GHOST_STATE_RW;
++	data->start = base + code_length;
++	data->handle = atomic64_inc_return(&gh_ghost_next_handle);
++	data->state = GH_GHOST_STATE_RW;
++
++	/* Probing both regions first allocates every intermediate page table.
++	 * Installation then cannot partially succeed because of page-table
++	 * allocation failure, and no VMA operation can race the mmap lock. */
++	txn.op = GH_GHOST_PTE_PROBE;
++	txn.region = code;
++	ret = apply_to_page_range(mm, code->start, code->length,
++				  gh_ghost_pte_callback, &txn);
++	if (ret)
++		goto fail_unlock;
++	txn.region = data;
++	ret = apply_to_page_range(mm, data->start, data->length,
++				  gh_ghost_pte_callback, &txn);
++	if (ret)
++		goto fail_unlock;
++
++	txn.prot = vm_get_page_prot(VM_READ | VM_WRITE | VM_MAYREAD |
++				    VM_MAYWRITE | VM_SHARED);
++	txn.op = GH_GHOST_PTE_INSTALL;
++	txn.region = code;
++	ret = apply_to_page_range(mm, code->start, code->length,
++				  gh_ghost_pte_callback, &txn);
++	if (ret)
++		goto fail_install;
++	txn.region = data;
++	ret = apply_to_page_range(mm, data->start, data->length,
++				  gh_ghost_pte_callback, &txn);
++	if (ret)
++		goto fail_install;
++	flush_tlb_mm(mm);
++	list_add_tail(&code->node, &gh_ghost_regions);
++	list_add_tail(&data->node, &gh_ghost_regions);
++	*base_out = base;
++	*code_handle_out = code->handle;
++	*data_handle_out = data->handle;
++	mutex_unlock(&gh_ghost_lock);
++	mmap_write_unlock(mm);
++	return 0;
++
++fail_install:
++	(void)gh_ghost_rollback_locked(data);
++	(void)gh_ghost_rollback_locked(code);
++fail_unlock:
++	mutex_unlock(&gh_ghost_lock);
++	mmap_write_unlock(mm);
++	gh_ghost_release_region(data);
++fail_code:
++	gh_ghost_release_region(code);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(gh_ghost_region_create_pair_auto);
++
+ int gh_ghost_region_write(struct mm_struct *mm, u64 handle,
+ 			  unsigned long offset, const void *src, size_t len)
+ {
+@@ -347,8 +521,9 @@ int gh_ghost_region_seal_rx(struct mm_struct *mm, u64 handle)
+ 	ret = apply_to_page_range(mm, region->start, region->length,
+ 					 gh_ghost_pte_callback, &txn);
+ 	if (ret) {
+-		/* Fail closed: no leaf PTE is preferable to a partly sealed region. */
+-		(void)gh_ghost_clear_locked(region);
++		/* Restore the complete RW mapping rather than leave a partial RX
++		 * transition that can neither be retried nor safely destroyed. */
++		(void)gh_ghost_restore_locked(region);
+ 		goto out;
+ 	}
+ 	flush_tlb_mm(mm);
+@@ -375,8 +550,10 @@ int gh_ghost_region_destroy(struct mm_struct *mm, u64 handle)
+ 		goto out;
+ 	}
+ 	ret = gh_ghost_clear_locked(region);
+-	if (ret)
++	if (ret) {
++		(void)gh_ghost_restore_locked(region);
+ 		goto out;
++	}
+ 	list_del(&region->node);
+ 	mutex_unlock(&gh_ghost_lock);
+ 	mmap_write_unlock(mm);
+@@ -389,6 +566,50 @@ out:
+ }
+ EXPORT_SYMBOL_GPL(gh_ghost_region_destroy);
+ 
++int gh_ghost_region_destroy_pair(struct mm_struct *mm, u64 code_handle,
++				 u64 data_handle)
++{
++	struct gh_ghost_region *code, *data;
++	int ret;
++
++	if (!mm || !code_handle || !data_handle || code_handle == data_handle)
++		return -EINVAL;
++	mmap_write_lock(mm);
++	mutex_lock(&gh_ghost_lock);
++	code = gh_ghost_find_handle_locked(mm, code_handle);
++	data = gh_ghost_find_handle_locked(mm, data_handle);
++	if (!code || !data || code->start + code->length != data->start ||
++	    (code->state != GH_GHOST_STATE_RW &&
++	     code->state != GH_GHOST_STATE_RX) ||
++	    data->state != GH_GHOST_STATE_RW) {
++		ret = -ENOENT;
++		goto out;
++	}
++	ret = gh_ghost_clear_locked(code);
++	if (ret) {
++		(void)gh_ghost_restore_locked(code);
++		goto out;
++	}
++	ret = gh_ghost_clear_locked(data);
++	if (ret) {
++		(void)gh_ghost_restore_locked(data);
++		(void)gh_ghost_restore_locked(code);
++		goto out;
++	}
++	list_del(&code->node);
++	list_del(&data->node);
++	mutex_unlock(&gh_ghost_lock);
++	mmap_write_unlock(mm);
++	gh_ghost_release_region(code);
++	gh_ghost_release_region(data);
++	return 0;
++out:
++	mutex_unlock(&gh_ghost_lock);
++	mmap_write_unlock(mm);
++	return ret;
++}
++EXPORT_SYMBOL_GPL(gh_ghost_region_destroy_pair);
++
+ int gh_ghost_region_query(struct mm_struct *mm, unsigned long addr,
+ 			  struct gh_ghost_region_info *out)
+ {

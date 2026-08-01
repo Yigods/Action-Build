@@ -52,7 +52,8 @@ for patch in \
     "$self_dir/0020-ghosthook-drain-final-owned-hwss.patch" \
     "$self_dir/0021-ghosthook-add-bpr-follow-range-trace.patch" \
     "$self_dir/0022-ghosthook-add-bounded-ghcp-syscall-router.patch" \
-    "$self_dir/0023-ghosthook-add-ghcp-v2-response-abi.patch"; do
+    "$self_dir/0023-ghosthook-add-ghcp-v2-response-abi.patch" \
+    "$self_dir/0024-ghosthook-add-atomic-ghost-pair-capability.patch"; do
     [ -f "$patch" ] || { echo "missing patch: $patch" >&2; exit 5; }
     git -C "$common" apply --check "$patch"
     git -C "$common" apply "$patch"
@@ -102,5 +103,13 @@ require_pattern '__ARCH_WANT_GHOSTHOOK_CONTROL' "$common/arch/arm64/include/uapi
 require_pattern 'gh_control_register_v2' "$common/kernel/gh_control.c"
 require_pattern 'SYSCALL_DEFINE4(ghosthook_control' "$common/kernel/gh_control.c"
 require_pattern 'GH_CONTROL_V2_RESPONSE_MAX 4096U' "$common/include/linux/ghosthook.h"
+require_pattern 'GH_CONTROL_CAPABILITY_CALL 8U' "$common/include/linux/ghosthook.h"
+require_pattern 'header.command > GH_CONTROL_CAPABILITY_CALL' "$common/kernel/gh_control.c"
+require_pattern 'gh_ghost_region_create_pair_auto' "$common/mm/gh_ghost.c"
+require_pattern 'EXPORT_SYMBOL_GPL(gh_ghost_region_create_pair_auto)' "$common/mm/gh_ghost.c"
+require_pattern 'EXPORT_SYMBOL_GPL(gh_ghost_region_destroy_pair)' "$common/mm/gh_ghost.c"
+require_pattern 'mm != current->mm' "$common/mm/gh_ghost.c"
+require_pattern 'GH_GHOST_PTE_ROLLBACK' "$common/mm/gh_ghost.c"
+require_pattern 'GH_GHOST_PTE_RESTORE' "$common/mm/gh_ghost.c"
 test -f "$common/include/linux/ghosthook.h"
 printf 'GhostHook explicit router stack applied to %s\n' "$actual"

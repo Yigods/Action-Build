@@ -83,7 +83,7 @@ on:
           - N/A
       GH_GHOSTHOOK_ROUTER_6118:
         type: boolean
-        description: "GhostHook: pin PKG110 6.1.118 source and add r14c bounded code/data Ghost pair + passive undef-trace core (test-only)"
+        description: "GhostHook: pin PKG110 6.1.118 and apply reviewed r26 GHCP/Ghost capability stack (test-only)"
         required: true
         default: false
       SUSFS_META:
@@ -567,6 +567,9 @@ jobs:
             curl --fail --location --silent --show-error \
               "$GH_PATCH_BASE/0023-ghosthook-add-ghcp-v2-response-abi.patch" \
               -o "$GH_PATCH_DIR/0023-ghosthook-add-ghcp-v2-response-abi.patch"
+            curl --fail --location --silent --show-error \
+              "$GH_PATCH_BASE/0024-ghosthook-add-atomic-ghost-pair-capability.patch" \
+              -o "$GH_PATCH_DIR/0024-ghosthook-add-atomic-ghost-pair-capability.patch"
             curl --fail --location --silent --show-error \
               "$GH_PATCH_BASE/apply_explicit_router.sh" \
               -o "$GH_PATCH_DIR/apply_explicit_router.sh"
